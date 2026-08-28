@@ -73,6 +73,51 @@ def test_default_ticker_empty_when_filing_has_none():
     check("ticker 为空字符串", row[2], "")
 
 
+def test_fetch_filings_for_tickers_drops_stale_filings():
+    """
+    不打真实网络：把 edgar.Company 换成假的，模拟一只 ticker 下有一条最近的
+    申报和一条很久以前的申报，验证 days_back 窗口过滤只保留最近的那条 ——
+    否则每天都会把好几年前的历史申报当成"最近发生的原因"重新入库。
+    """
+    print("\nfetch_filings_for_tickers 应该按 days_back 窗口过滤掉陈旧申报")
+    import edgar as edgar_module
+    from datetime import date, timedelta
+
+    recent = (date.today() - timedelta(days=1)).isoformat()
+    stale = (date.today() - timedelta(days=400)).isoformat()
+
+    class FakeFilings:
+        def __init__(self, items):
+            self._items = items
+        def __iter__(self):
+            return iter(self._items)
+        def __getitem__(self, k):
+            return self._items[k]
+
+    class FakeCompany:
+        def __init__(self, ticker):
+            self.ticker = ticker
+        def get_filings(self, form=None):
+            return FakeFilings([
+                SimpleNamespace(accession_no="acc-recent", filing_date=recent,
+                                items="5.02", cik="1", filing_url="", company="X"),
+                SimpleNamespace(accession_no="acc-stale", filing_date=stale,
+                                items="5.02", cik="1", filing_url="", company="X"),
+            ])
+
+    orig_company = getattr(edgar_module, "Company", None)
+    edgar_module.Company = FakeCompany
+    try:
+        res = E.fetch_filings_for_tickers("test@example.com", ["FAKE"],
+                                          forms=("8-K",), days_back=7, limit_per=10)
+    finally:
+        if orig_company is not None:
+            edgar_module.Company = orig_company
+
+    accs = sorted(r[0] for r in res.data)
+    check("只保留窗口内的那条", accs, ["acc-recent"])
+
+
 if __name__ == "__main__":
     test_ticker_filled_when_passed_explicitly()
     test_items_as_list_gets_joined_with_comma()
@@ -80,6 +125,7 @@ if __name__ == "__main__":
     test_accession_falls_back_to_accession_number()
     test_default_ticker_falls_back_to_filing_attribute()
     test_default_ticker_empty_when_filing_has_none()
+    test_fetch_filings_for_tickers_drops_stale_filings()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
