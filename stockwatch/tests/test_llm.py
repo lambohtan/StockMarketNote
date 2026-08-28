@@ -86,6 +86,12 @@ def test_dry_run_returns_placeholder_and_calls_nothing():
     check("标注了 dry-run", "dry-run" in out, True)
 
 
+def test_unknown_provider_is_fatal():
+    print("\n配置守卫：未知 provider 必须报错（变异测试轮 4 发现的覆盖缺口）")
+    check_raises("provider='deepseek' → 报错",
+                 lambda: LM.check_env(Cfg("deepseek")), LM.LLMConfigError)
+
+
 def test_output_passes_directive_guard():
     print("\nLLM 输出也要过指令性措辞守卫")
     from sw.alerts import assert_no_directives
@@ -98,6 +104,7 @@ def test_output_passes_directive_guard():
 if __name__ == "__main__":
     test_api_key_conflict_is_fatal()
     test_api_mode_without_key_is_fatal()
+    test_unknown_provider_is_fatal()
     test_cli_cmd_shape()
     test_dry_run_returns_placeholder_and_calls_nothing()
     test_output_passes_directive_guard()
