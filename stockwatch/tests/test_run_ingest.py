@@ -50,10 +50,80 @@ def test_dry_run_never_writes():
     check("dry-run 不写（即使 ok=True）", RI._should_write_edgar(res_ok, dry_run=True), False)
 
 
+def test_main_writes_edgar_rows_even_when_ticker_query_partially_failed():
+    """
+    修复轮 2 · Critical 1（变异 2 专用）：只测 _should_write_edgar 这个
+    辅助函数，抓不住"main() 里的调用点被人改回直接用 tres.ok"这类回归——
+    毕竟辅助函数本身没坏，坏的是调用点绕过了它。这里补一个端到端集成测试，
+    monkeypatch 掉所有网络数据源（价格/元数据/Reddit/EDGAR 全市场扫描），
+    只让 fetch_filings_for_tickers 返回"抓到 1 行但 ok=False"（模拟 25 只
+    里 24 只成功、1 只报错的真实场景），真正跑一遍 main()，断言这一行确实
+    被写进了库——不是复用真实库，是用 STOCKWATCH_DB 环境变量指向的临时库
+    （sw.config.Config.db_path 本来就是为这种场景设计的：优先读环境变量，
+    "方便用测试库跑验证而不污染真实快照历史"）。
+    """
+    print("\n端到端：main() 里即使 tres.ok=False，只要 rows>0 也应该写库")
+    import os, sys as _sys, tempfile, json as _json
+    from sw.sources.base import SourceResult
+    from sw.store import Store
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+
+    orig_env = os.environ.get("STOCKWATCH_DB")
+    orig_argv = _sys.argv
+    orig_fetch_prices = RI.P.fetch_prices
+    orig_fetch_meta = RI.P.fetch_meta
+    orig_fetch_reddit = RI.R.fetch_reddit
+    orig_fetch_filings = RI.E.fetch_filings
+    orig_fetch_filings_for_tickers = RI.E.fetch_filings_for_tickers
+
+    def fake_ok_empty(*a, **kw):
+        return SourceResult(source="fake", ok=True, rows=0, latency_ms=1, detail="", data=[])
+
+    def fake_tres(*a, **kw):
+        # 模拟"抓到数据但过程不完全顺利"：AAPL 这一行成功，同时至少一只
+        # ticker 报错——ok=False，rows>0，正是 Critical 1 描述的场景
+        row = ("acc-integration-test", "2026-08-27", "AAPL", "320193", "8-K",
+              "5.02", "https://sec.gov/acc-integration-test",
+              _json.dumps({"company": "Apple Inc."}), "2026-08-27T00:00:00")
+        return SourceResult(source="edgar.filings_by_ticker", ok=False, rows=1,
+                            latency_ms=1, detail="模拟部分失败", data=[row])
+
+    try:
+        os.environ["STOCKWATCH_DB"] = tmp.name
+        _sys.argv = ["run_ingest.py"]   # 不带 --positions、不带 --dry-run
+        RI.P.fetch_prices = fake_ok_empty
+        RI.P.fetch_meta = fake_ok_empty
+        RI.R.fetch_reddit = fake_ok_empty
+        RI.E.fetch_filings = fake_ok_empty
+        RI.E.fetch_filings_for_tickers = fake_tres
+        RI.main()
+    finally:
+        if orig_env is not None:
+            os.environ["STOCKWATCH_DB"] = orig_env
+        else:
+            os.environ.pop("STOCKWATCH_DB", None)
+        _sys.argv = orig_argv
+        RI.P.fetch_prices = orig_fetch_prices
+        RI.P.fetch_meta = orig_fetch_meta
+        RI.R.fetch_reddit = orig_fetch_reddit
+        RI.E.fetch_filings = orig_fetch_filings
+        RI.E.fetch_filings_for_tickers = orig_fetch_filings_for_tickers
+
+    st = Store(tmp.name)
+    rows = st.q("SELECT * FROM edgar_filings WHERE accession=?", ("acc-integration-test",))
+    check("端到端跑完 main() 后，部分失败但抓到的那行确实写进库了", len(rows), 1)
+    if rows:
+        check("ticker 字段完整", rows[0]["ticker"], "AAPL")
+    st.close()
+
+
 if __name__ == "__main__":
     test_writes_when_rows_found_even_if_ok_is_false()
     test_does_not_write_when_no_rows()
     test_dry_run_never_writes()
+    test_main_writes_edgar_rows_even_when_ticker_query_partially_failed()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
