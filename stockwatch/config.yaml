@@ -42,6 +42,10 @@ notify:
   ntfy_server: "https://ntfy.sh"
 
 llm:
+  # claude_cli = 调 claude -p 走 Pro 订阅，不额外花钱但占用订阅额度
+  # api        = 调 Anthropic API 按量付费，key 只写进 launchd plist
+  provider: "claude_cli"
+  claude_bin: "/Users/lambo/.local/bin/claude"
   # 换模型改这一行。可选（含每百万 token 的输入/输出价格）：
   #   claude-opus-5    $5 / $25    默认，最强
   #   claude-sonnet-5  $2 / $10    够用且便宜一半以上
