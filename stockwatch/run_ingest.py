@@ -71,6 +71,11 @@ def main():
     hr("2 / 4  行情与元数据")
     res = P.fetch_prices(sorted(universe), period=CFG.get("history.price_period", "2y"))
     print(f"  {'✅' if res.ok else '❌'} 价格 {res.rows} 行 ({res.latency_ms}ms) {res.detail}")
+    if res.ok:
+        from sw.market_time import drop_incomplete_bars
+        res.data, dropped = drop_incomplete_bars(res.data)
+        if dropped:
+            print(f"  ⚠️ 剔除未收盘的当日 bar：{dropped}（避免污染回归）")
     if res.ok and not a.dry_run:
         st.upsert_many("prices", ["d","ticker","close","volume"], res.data)
     st.log_health(res.source, res.ok, res.latency_ms, res.detail)
