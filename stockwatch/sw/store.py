@@ -131,6 +131,20 @@ class Store:
             c.executemany(sql, rows)
         return len(rows)
 
+    def insert_ignore_many(self, table, cols, rows):
+        """INSERT OR IGNORE —— 已存在的主键不覆盖。
+
+        用于全市场 EDGAR 扫描：它拿不到 ticker/items（索引行结构如此），
+        绝不能覆盖按持仓查询写入的完整行。申报内容本身不会变，
+        所以「不更新已存在的行」没有副作用。"""
+        if not rows:
+            return 0
+        ph = ",".join("?" * len(cols))
+        sql = f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({ph})"
+        with self.tx() as c:
+            c.executemany(sql, rows)
+        return len(rows)
+
     def log_health(self, source, ok, latency_ms, detail=""):
         with self.tx() as c:
             c.execute(

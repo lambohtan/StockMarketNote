@@ -108,11 +108,24 @@ def fetch_filings_for_tickers(email, tickers, forms=("8-K", "4"), days_back=7, l
                 fl = c.get_filings(form=form)
                 if fl is None:
                     continue
-                for f in list(fl)[:limit_per]:
+                # 修复轮 2 · Important 5：必须先按 days_back 过滤，再用 limit_per
+                # 截断——原来的顺序反了（先切片再过滤），完全依赖"返回按时间倒序"
+                # 这个未经验证的假设，申报密集的票会把窗口内的记录静默截掉。
+                in_window = []
+                for f in fl:
                     try:
                         filed = str(getattr(f, "filing_date", ""))
                         if filed and filed < cutoff:
                             continue    # 只保留窗口内的，避免每天重复入库几年的历史
+                        in_window.append(f)
+                    except Exception:
+                        continue
+                if len(in_window) > limit_per:
+                    # 截断真的发生了，不能静默——记一笔让 source_health 看得见
+                    errs.append(f"{tk}/{form}: 窗口内 {len(in_window)} 条，"
+                                f"只取前 {limit_per} 条，{len(in_window)-limit_per} 条被截断")
+                for f in in_window[:limit_per]:
+                    try:
                         rows.append(_assemble_row(f, form, now, ticker=tk))
                     except Exception:
                         continue
