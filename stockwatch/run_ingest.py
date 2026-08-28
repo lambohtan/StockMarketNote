@@ -21,15 +21,53 @@ def hr(t):
     print(f"\n{'='*60}\n{t}\n{'='*60}")
 
 
-def _should_write_edgar(res, dry_run):
+EDGAR_COLS = ["accession", "filed_at", "ticker", "cik", "form", "items",
+             "url", "raw_json", "seen_at"]
+
+
+def ingest_edgar(st, email, positions_tickers, dry_run=False,
+                 fetch_all=None, fetch_by_ticker=None):
     """
-    修复轮 2 · Critical 1：写库门槛只看「有没有抓到数据」（res.rows > 0），
-    不能看 res.ok —— fetch_filings_for_tickers 的 ok 反映的是「整个查询
-    过程有没有出错」（任何一只 ticker/表单失败都会让 ok=False），但那不该
-    连累其余几十只已经成功抓到的行一行都不写。抽成函数是为了这条判断本身
-    能被单测覆盖，而不是靠跑一次真正的 run_ingest.py 才能验证。
+    EDGAR 抓取与入库。两条路径：
+
+    - 全市场扫描：拿不到 ticker/items（索引行结构如此，修复轮 1 实测确认），
+      用 insert_ignore_many 写入，绝不覆盖按持仓查询已经填好的完整行
+      （修复轮 2 · Critical 2）。
+    - 按持仓逐个查：能拿到 items，ticker 是查询时已知的，用 upsert_many
+      覆盖（内容本来就该以这条路径为准）。
+
+    写库门槛一律是 rows > 0，不是 ok —— ok 反映的是「查询过程是否顺利」
+    （len(errs)==0），而 25+ 只持仓里任一只限流/报错都会让 ok=False，
+    那会把其余几十只已经成功抓到的数据全部丢弃，而且是**静默的**、不报错、
+    不打印异常，只是 edgar_filings 悄悄没有新数据（修复轮 2 · Critical 1）。
+    ok 只喂 log_health，不参与写库判断。
+
+    抽成这个函数、把 fetch_all / fetch_by_ticker 做成可注入依赖，是因为
+    修复轮 2 里把判断单独抽成 _should_write_edgar 之后，仍然抓不住
+    「main() 里的调用点绕开辅助函数、又写回 .ok 门槛」这类回归——纯函数
+    本身没坏，坏的是调用点。这里直接测这个函数的**行为**（真的往库里写
+    了什么），而不是只测判断条件本身。
+
+    返回 (eres, tres) 方便调用方在需要时检查结果（比如测试里断言
+    log_health 收到的 ok 是不是真实值）。
     """
-    return res.rows > 0 and not dry_run
+    fetch_all = fetch_all or E.fetch_filings
+    fetch_by_ticker = fetch_by_ticker or E.fetch_filings_for_tickers
+
+    eres = fetch_all(email, forms=("8-K", "4"))
+    print(f"  {'✅' if eres.ok else '❌'} 全市场 {eres.rows} 条 ({eres.latency_ms}ms) {eres.detail}")
+    if eres.rows > 0 and not dry_run:
+        st.insert_ignore_many("edgar_filings", EDGAR_COLS, eres.data)
+    st.log_health(eres.source, eres.ok, eres.latency_ms, eres.detail)
+
+    tres = fetch_by_ticker(email, sorted(positions_tickers), forms=("8-K", "4"))
+    print(f"  {'✅' if tres.ok else '❌'} 按持仓 {tres.rows} 条 ({tres.latency_ms}ms) {tres.detail}")
+    if tres.rows > 0 and not dry_run:
+        st.upsert_many("edgar_filings", EDGAR_COLS, tres.data)
+    st.log_health(tres.source, tres.ok, tres.latency_ms, tres.detail)
+
+    return eres, tres
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -118,32 +156,10 @@ def main():
     if a.skip_edgar:
         print("  跳过")
     else:
-        eres = E.fetch_filings(CFG.get("identity.sec_email"), forms=("8-K","4"))
-        print(f"  {'✅' if eres.ok else '❌'} 全市场 {eres.rows} 条 ({eres.latency_ms}ms) {eres.detail}")
-        # 修复轮 2 · Critical 2：全市场扫描拿不到 ticker/items（只有 cik），
-        # 必须用 insert_ignore_many（INSERT OR IGNORE），不能覆盖按持仓查询
-        # 已经写好的完整行——否则同一条申报会被这条路径连续几天重新抹空。
-        if _should_write_edgar(eres, a.dry_run):
-            st.insert_ignore_many("edgar_filings",
-                                  ["accession","filed_at","ticker","cik","form","items",
-                                   "url","raw_json","seen_at"], eres.data)
-        st.log_health(eres.source, eres.ok, eres.latency_ms, eres.detail)
-
-        # 修复轮 1：全市场索引不带 ticker/items（已实测确认），causes.py 找原因
-        # 要靠这两个字段匹配 —— 所以对持仓再按 ticker 逐个查一遍，补上这两个字段。
-        # 只对真实持仓查，不对基准/行业 ETF 查。
-        tres = E.fetch_filings_for_tickers(CFG.get("identity.sec_email"),
-                                           sorted(positions_tickers), forms=("8-K","4"))
-        print(f"  {'✅' if tres.ok else '❌'} 按持仓 {tres.rows} 条 ({tres.latency_ms}ms) {tres.detail}")
-        # 修复轮 2 · Critical 1：写库门槛不能用 tres.ok —— ok 反映的是
-        # "查询过程是否顺利"（len(errs)==0），25+ 只持仓 × 2 种 form 里
-        # 任何一只限流/报错都会让 ok=False，但其余几十只已经抓到的行不该被
-        # 因此一行都不写。写库门槛只看有没有抓到数据，ok 只用来喂健康记录。
-        if _should_write_edgar(tres, a.dry_run):
-            st.upsert_many("edgar_filings",
-                           ["accession","filed_at","ticker","cik","form","items",
-                            "url","raw_json","seen_at"], tres.data)
-        st.log_health(tres.source, tres.ok, tres.latency_ms, tres.detail)
+        # 修复轮 3：全市场扫描 + 按持仓查询这两条路径的写库逻辑抽成
+        # ingest_edgar（见函数注释），只对真实持仓查，不对基准/行业 ETF 查。
+        ingest_edgar(st, CFG.get("identity.sec_email"), positions_tickers,
+                    dry_run=a.dry_run)
 
     hr("数据库状态")
     for k, v in st.stats().items():

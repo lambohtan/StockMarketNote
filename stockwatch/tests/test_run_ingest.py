@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""run_ingest.py 里写库门槛判断的测试。运行：python3 tests/test_run_ingest.py
+"""run_ingest.py 里 EDGAR 写库逻辑的测试。运行：python3 tests/test_run_ingest.py
 
-修复轮 2 · Critical 1：审查发现 `if tres.ok and not a.dry_run` 这条写库门槛
-用错了信号 —— fetch_filings_for_tickers 的 ok 反映的是「整个查询过程有没
-有出错」，持仓有 25+ 只、每只查 2 种 form，任何一只限流/网络抖动都会让
-ok=False；如果门槛用 ok，其余几十只已经成功抓到的行会一行都不写，把
-「find_causes 必现返回 []」变成「偶发、更难发现的空数据」。
+修复轮 2 · Critical 1：`if tres.ok and not a.dry_run` 这条写库门槛用错了
+信号——fetch_filings_for_tickers 的 ok 反映的是「整个查询过程有没有出错」，
+持仓有 25+ 只、每只查 2 种 form，任何一只限流/网络抖动都会让 ok=False；
+如果门槛用 ok，其余几十只已经成功抓到的行会一行都不写。
 
-正确的门槛应该只看「有没有抓到数据」（rows > 0），ok 只用来喂健康记录。
-这里把判断抽成 `_should_write_edgar`，直接单测这个函数，不需要真的跑一遍
-run_ingest.py（那需要网络和持仓 CSV，不适合做单元测试）。
+修复轮 2 第一次修法是把判断抽成 `_should_write_edgar` 纯函数并单测它——
+结果修复轮 3 的复审发现：这条纯函数本身没坏，坏的是 main() 里的调用点
+被人绕开它、写回 `.ok` 门槛，而单测那个纯函数完全看不出来（8 个测试文件
+全绿）。而且这类失败是**静默**的——不抛异常、不报错，只是 edgar_filings
+悄悄没写入新数据，find_causes 因此恒返回 []。
+
+修复轮 3 把整段 EDGAR 抓取与入库逻辑抽成 `ingest_edgar(st, email,
+positions_tickers, dry_run, fetch_all, fetch_by_ticker)`，fetch_all /
+fetch_by_ticker 可注入假实现——这样测的是这个函数真实的**行为**（库里
+到底写没写、写了什么），而不是一个可能没被实际调用点使用的判断条件。
 """
-import sys
+import sys, tempfile, json
 from pathlib import Path
-from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import run_ingest as RI
+from sw.store import Store
+from sw.sources.base import SourceResult
 
 FAIL = []
 
@@ -26,46 +33,120 @@ def check(name, got, want):
         FAIL.append(name)
 
 
-def test_writes_when_rows_found_even_if_ok_is_false():
+def fresh_store():
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    return Store(tmp.name)
+
+
+def _empty_ok(*a, **kw):
+    """假的 fetch_all：什么都没抓到，但过程顺利。"""
+    return SourceResult(source="edgar.filings", ok=True, rows=0, latency_ms=1,
+                        detail="", data=[])
+
+
+def test_partial_failure_still_writes():
     """
-    核心场景：25 只里 24 只成功、1 只报错 —— rows>0 但 ok=False。
-    这条数据必须被写进去，不能因为个别 ticker 出错就整批放弃。
+    核心场景：持仓 25 只里 24 只查询成功、1 只报错——fetch_by_ticker
+    返回 ok=False 但 rows=3（另外几只查到的数据）。这 3 行必须被写进库，
+    不能因为个别 ticker 出错就整批放弃（否则就是 Critical 1 的静默丢数据）。
     """
-    print("\n部分失败但抓到了数据（rows>0, ok=False）时，仍然应该写库")
-    res = SimpleNamespace(rows=24, ok=False)
-    check("应该写", RI._should_write_edgar(res, dry_run=False), True)
+    print("\n部分失败但抓到了数据（ok=False, rows=3）时，这些行仍应写进库")
+    st = fresh_store()
+    rows = [
+        ("acc-1", "2026-08-27", "AAPL", "1", "8-K", "5.02", "u1", "{}", "t"),
+        ("acc-2", "2026-08-27", "NVDA", "2", "8-K", "2.02", "u2", "{}", "t"),
+        ("acc-3", "2026-08-27", "MU", "3", "8-K", "7.01", "u3", "{}", "t"),
+    ]
+
+    def fake_by_ticker(*a, **kw):
+        return SourceResult(source="edgar.filings_by_ticker", ok=False, rows=3,
+                            latency_ms=1, detail="1 只 ticker 报错", data=rows)
+
+    RI.ingest_edgar(st, "test@example.com", ["AAPL", "NVDA", "MU"], dry_run=False,
+                    fetch_all=_empty_ok, fetch_by_ticker=fake_by_ticker)
+
+    got = st.q("SELECT accession FROM edgar_filings ORDER BY accession")
+    check("3 行都写进去了", [r["accession"] for r in got], ["acc-1", "acc-2", "acc-3"])
+    st.close()
 
 
-def test_does_not_write_when_no_rows():
-    print("\n完全没抓到数据（rows=0）时，即使 ok=True 也没什么好写的")
-    res = SimpleNamespace(rows=0, ok=True)
-    check("不该写", RI._should_write_edgar(res, dry_run=False), False)
+def test_market_wide_does_not_clobber():
+    """
+    真实生产场景：先靠按持仓查询写入一条完整的行（ticker/items 都有），
+    过几天全市场扫描又扫到同一个 accession（它拿不到 ticker/items，只有
+    cik），这时候按持仓那步这次没有再次成功抓到它（比如已经不在
+    days_back 窗口内、或者恰好这次查询报错）——完整行不该被抹空。
+    """
+    print("\n全市场扫描不该抹空已有的完整行（分两次调用 ingest_edgar 模拟跨天场景）")
+    st = fresh_store()
+
+    def fake_by_ticker_full(*a, **kw):
+        row = ("acc-clobber", "2026-08-27", "AAPL", "320193", "8-K",
+              "2.02,9.01", "https://sec.gov/acc-clobber", "{}", "t1")
+        return SourceResult(source="edgar.filings_by_ticker", ok=True, rows=1,
+                            latency_ms=1, detail="", data=[row])
+
+    def fake_by_ticker_empty(*a, **kw):
+        return SourceResult(source="edgar.filings_by_ticker", ok=True, rows=0,
+                            latency_ms=1, detail="", data=[])
+
+    def fake_all_clobbers(*a, **kw):
+        # 全市场扫描拿到同一个 accession，但没有 ticker/items
+        row = ("acc-clobber", "2026-08-27", "", "320193", "8-K",
+              "", "https://sec.gov/acc-clobber", "{}", "t2")
+        return SourceResult(source="edgar.filings", ok=True, rows=1,
+                            latency_ms=1, detail="", data=[row])
+
+    # 第一次调用（模拟第 1 天）：按持仓查到完整行
+    RI.ingest_edgar(st, "test@example.com", ["AAPL"], dry_run=False,
+                    fetch_all=_empty_ok, fetch_by_ticker=fake_by_ticker_full)
+
+    # 第二次调用（模拟第 2 天）：全市场扫描又扫到同一条（空 ticker/items），
+    # 按持仓这次没有再次抓到它
+    RI.ingest_edgar(st, "test@example.com", ["AAPL"], dry_run=False,
+                    fetch_all=fake_all_clobbers, fetch_by_ticker=fake_by_ticker_empty)
+
+    row = st.q("SELECT * FROM edgar_filings WHERE accession=?", ("acc-clobber",))[0]
+    check("ticker 仍然完整（没被全市场扫描抹空）", row["ticker"], "AAPL")
+    check("items 仍然完整（没被全市场扫描抹空）", row["items"], "2.02,9.01")
+    st.close()
 
 
-def test_dry_run_never_writes():
-    print("\n--dry-run 时无论如何都不该写库")
-    res = SimpleNamespace(rows=24, ok=False)
-    check("dry-run 不写", RI._should_write_edgar(res, dry_run=True), False)
-    res_ok = SimpleNamespace(rows=24, ok=True)
-    check("dry-run 不写（即使 ok=True）", RI._should_write_edgar(res_ok, dry_run=True), False)
+def test_log_health_gets_real_ok():
+    """
+    log_health 记的 ok 必须是数据源真实返回的 ok，不能被恒 True/False
+    替换——这是运维排障时判断"是不是数据源真的出问题了"的依据。
+    """
+    print("\nlog_health 收到的应该是真实的 ok（哪怕是 False）")
+    st = fresh_store()
+
+    def fake_by_ticker_failed(*a, **kw):
+        return SourceResult(source="edgar.filings_by_ticker", ok=False, rows=0,
+                            latency_ms=1, detail="全部失败", data=[])
+
+    RI.ingest_edgar(st, "test@example.com", ["AAPL"], dry_run=False,
+                    fetch_all=_empty_ok, fetch_by_ticker=fake_by_ticker_failed)
+
+    rec = st.q("SELECT ok FROM source_health WHERE source=? ORDER BY ts DESC LIMIT 1",
+              ("edgar.filings_by_ticker",))
+    check("找到健康记录", len(rec), 1)
+    if rec:
+        check("ok 是真实的 False（没被替换成恒 True）", rec[0]["ok"], 0)
+    st.close()
 
 
 def test_main_writes_edgar_rows_even_when_ticker_query_partially_failed():
     """
-    修复轮 2 · Critical 1（变异 2 专用）：只测 _should_write_edgar 这个
-    辅助函数，抓不住"main() 里的调用点被人改回直接用 tres.ok"这类回归——
-    毕竟辅助函数本身没坏，坏的是调用点绕过了它。这里补一个端到端集成测试，
-    monkeypatch 掉所有网络数据源（价格/元数据/Reddit/EDGAR 全市场扫描），
-    只让 fetch_filings_for_tickers 返回"抓到 1 行但 ok=False"（模拟 25 只
-    里 24 只成功、1 只报错的真实场景），真正跑一遍 main()，断言这一行确实
-    被写进了库——不是复用真实库，是用 STOCKWATCH_DB 环境变量指向的临时库
-    （sw.config.Config.db_path 本来就是为这种场景设计的：优先读环境变量，
-    "方便用测试库跑验证而不污染真实快照历史"）。
+    修复轮 2 遗留的端到端护栏：ingest_edgar 本身的单测再全，也防不住
+    main() 干脆不调用它、自己重新手写一遍写库逻辑这类回归。这里仍然真正
+    跑一遍 main()（用 STOCKWATCH_DB 环境变量指向临时库，sw/config.py 的
+    Config.db_path 本来就为这个场景设计），monkeypatch 掉所有网络数据源，
+    只让 fetch_filings_for_tickers 返回"抓到 1 行但 ok=False"，断言这行
+    确实被写进了库。全程不打网络、不碰 data/stockwatch.db。
     """
-    print("\n端到端：main() 里即使 tres.ok=False，只要 rows>0 也应该写库")
-    import os, sys as _sys, tempfile, json as _json
-    from sw.sources.base import SourceResult
-    from sw.store import Store
+    print("\n端到端：main() 依然通过 ingest_edgar 正确写库")
+    import os, sys as _sys
 
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
@@ -78,25 +159,20 @@ def test_main_writes_edgar_rows_even_when_ticker_query_partially_failed():
     orig_fetch_filings = RI.E.fetch_filings
     orig_fetch_filings_for_tickers = RI.E.fetch_filings_for_tickers
 
-    def fake_ok_empty(*a, **kw):
-        return SourceResult(source="fake", ok=True, rows=0, latency_ms=1, detail="", data=[])
-
     def fake_tres(*a, **kw):
-        # 模拟"抓到数据但过程不完全顺利"：AAPL 这一行成功，同时至少一只
-        # ticker 报错——ok=False，rows>0，正是 Critical 1 描述的场景
         row = ("acc-integration-test", "2026-08-27", "AAPL", "320193", "8-K",
               "5.02", "https://sec.gov/acc-integration-test",
-              _json.dumps({"company": "Apple Inc."}), "2026-08-27T00:00:00")
+              json.dumps({"company": "Apple Inc."}), "2026-08-27T00:00:00")
         return SourceResult(source="edgar.filings_by_ticker", ok=False, rows=1,
                             latency_ms=1, detail="模拟部分失败", data=[row])
 
     try:
         os.environ["STOCKWATCH_DB"] = tmp.name
-        _sys.argv = ["run_ingest.py"]   # 不带 --positions、不带 --dry-run
-        RI.P.fetch_prices = fake_ok_empty
-        RI.P.fetch_meta = fake_ok_empty
-        RI.R.fetch_reddit = fake_ok_empty
-        RI.E.fetch_filings = fake_ok_empty
+        _sys.argv = ["run_ingest.py"]
+        RI.P.fetch_prices = _empty_ok
+        RI.P.fetch_meta = _empty_ok
+        RI.R.fetch_reddit = _empty_ok
+        RI.E.fetch_filings = _empty_ok
         RI.E.fetch_filings_for_tickers = fake_tres
         RI.main()
     finally:
@@ -120,9 +196,9 @@ def test_main_writes_edgar_rows_even_when_ticker_query_partially_failed():
 
 
 if __name__ == "__main__":
-    test_writes_when_rows_found_even_if_ok_is_false()
-    test_does_not_write_when_no_rows()
-    test_dry_run_never_writes()
+    test_partial_failure_still_writes()
+    test_market_wide_does_not_clobber()
+    test_log_health_gets_real_ok()
     test_main_writes_edgar_rows_even_when_ticker_query_partially_failed()
     print("\n" + "=" * 50)
     if FAIL:
