@@ -88,15 +88,18 @@ def test_push_version_has_no_money():
     from sw.notify import assert_no_money
     alert = {
         "ticker": "WXYZ", "level": "L1", "category": "8-K",
-        "facts": "8-K Item 5.02：CFO 离职",
+        # ← 故意在会进入推送正文的字段（facts）里塞金额：
+        #   如果只在 position 里塞（position 本来就不会进入 push 正文），
+        #   剥离逻辑被删掉也测不出来 —— 这里验证的是剥离本身真的生效。
+        "facts": "8-K Item 5.02：CFO 离职，协议约定遣散费 $500,000",
         "data": "当日 -8.7%（个股独立 -9.1%，4.1σ）",
         "base_rate": "历史上后续 6 个月重述比例高于基准",
         "counterpoint": "公司同日重申 Q3 指引",
-        "position": "成本 $558.87，市值 $683.94，占卫星仓 4.9%",   # ← 故意塞金额
+        "position": "成本 $558.87，市值 $683.94，占卫星仓 4.9%",   # 这个字段本就不进推送正文
         "next_steps": ["继任公告", "Q3 财报是否延期"],
     }
     title, body = AL.render_alert_push(alert)
-    assert_no_money(body)      # 抛异常就说明推送版没过滤掉金额
+    assert_no_money(body)      # 抛异常就说明推送版没过滤掉金额（facts 里的 $500,000 漏网了）
     assert_no_money(title)
     check("标题带级别", "L1" in title, True)
     check("标题带代码", "WXYZ" in title, True)
