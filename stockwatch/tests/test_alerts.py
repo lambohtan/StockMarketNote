@@ -415,6 +415,145 @@ def test_noun_suffix_exemption_for_gai_mai():
             print(f"  ✅ 拦下：{s!r}")
 
 
+def test_comma_bypass_position_based_exemption():
+    print("\n修复轮 4 · 逗号绕过：归属标记必须出现在豁免短语之前（位置判据，不是同句判据）")
+    # 复审实测：逗号是中文财经写作里最常见的标点，_SENTENCE_SPLIT 之前不切逗号，
+    # 一个逗号就能把最直白的指令和一个毫不相关的归属词连在一句里，整句放行。
+    MUST_BAN = [
+        "建议减仓，据悉近期宏观数据走弱",
+        "建议加仓，据悉行业景气度回升",
+        "建议卖出该持仓，另据分析师观点行业承压",
+        "目标价 300 美元，建议买入，评级机构同步表态",
+        "建议买入 NVDA，据报道行业景气度回升",
+    ]
+    for s in MUST_BAN:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ❌ 漏网：{s!r}")
+            FAIL.append(f"漏网(逗号绕过) {s}")
+        except ValueError:
+            print(f"  ✅ 拦下：{s!r}")
+
+    # 放行方向：归属在前、内容在后，即使隔着逗号（甚至跨切分片段）也要放行——
+    # 这是新闻转述的常见写法，不能因为治漏网就连这个也拦下。
+    MUST_ALLOW = [
+        "高盛表示，目标价 180 美元",
+        "据分析师报告，建议买入评级维持不变",   # 归属在前一个片段，豁免短语在后一个片段
+        "该分析师维持「建议持有」评级",         # 回归：无逗号的原始形态仍要放行
+        "据报道，多家券商上调目标价",
+    ]
+    for s in MUST_ALLOW:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ✅ 放行：{s}")
+        except ValueError as e:
+            print(f"  ❌ 误伤：{s!r} —— {e}")
+            FAIL.append(f"误伤(逗号绕过) {s}")
+
+
+def test_comprehensive_ab_matrix():
+    """
+    验收证据：把前四轮累积的全部正负样本合到一起，一次性双向压测。
+    A 组（必须放行，客观陈述/合法转述）和 B 组（必须拦下，指令性措辞）
+    同时零失败，才能说这个模块真的同时守住了两个方向。
+    """
+    print("\n修复轮 4 · 收尾：完整 A/B 双向压测（验收证据）")
+
+    A_ALLOW = [
+        # --- 基线：客观陈述 ---
+        "内部人集中卖出，排除 10b5-1 预设计划后仍有 3 笔",
+        "该公司 CFO 于 08/27 离职，未披露继任安排",
+        "这类信号历史上后续 6 个月出现财务重述的比例高于基准",
+        "加入后你的组合年化波动率从 56.7% 变为 61.2%",
+        "股价当日 -8.7%，其中个股独立部分 -9.1%（4.1σ）",
+        "接下来看什么：① 继任公告 ② Q3 财报是否延期 ③ 审计师是否变动",
+        "公司同日重申了 Q3 指引",
+        # --- round1：转述第三方 ---
+        "该分析师维持「建议持有」评级",
+        "高盛下调目标价至 $180",
+        "厂商建议零售价上调 8%",
+        "该买家此前已持有该公司 5% 股份",
+        "审计整改函中建议加强内部控制",
+        "公司披露其外汇套期保值止损位",
+        # --- round2：交易价格区间 / 该卖出方 ---
+        "该笔交易的买入价区间为 45 至 48 美元",
+        "审计函建议减少对单一供应商的依赖",
+        "该卖出方为公司前董事",
+        # --- round3：短标记硬化后仍要认得的场景 + 根据/数据本身不是禁用词 ---
+        "据报道该公司考虑出售非核心资产",
+        "据悉该公司正在评估战略选择",
+        "根据审计报告，公司披露了三项整改事项",
+        "数据显示行业库存处于五年高位",
+        # --- round4：逗号 + 归属在前 ---
+        "高盛表示，目标价 180 美元",
+        "据分析师报告，建议买入评级维持不变",
+        "据报道，多家券商上调目标价",
+    ]
+
+    B_BAN = [
+        # --- 基线：直白指令 ---
+        "建议买入 NVDA",
+        "建议卖出该持仓",
+        "你应该减少科技股敞口",
+        "赶紧处理这个仓位",
+        "该减仓了",
+        "止损设在 $180",
+        "目标价 $250",
+        "务必在财报前调整",
+        # --- round2：无归属的豁免短语 / 专属标记越界 ---
+        "你的买入价应该设在 180",
+        "建议减仓至 3%",
+        "建议买入该交易标的 NVDA",
+        # --- round3：短标记子串碰撞 / 该买卖名词后缀 ---
+        "根据模型评分，建议买入该标的NVDA",
+        "根据历史数据，建议卖出该持仓",
+        "占据主导地位后，建议减仓以锁定收益",
+        "依据回测结果，建议加仓",
+        "该卖出这些质地一般的仓位了",
+        "该买这只票",
+        # --- round4：逗号绕过 ---
+        "建议减仓，据悉近期宏观数据走弱",
+        "建议加仓，据悉行业景气度回升",
+        "建议卖出该持仓，另据分析师观点行业承压",
+        "目标价 300 美元，建议买入，评级机构同步表态",
+        "建议买入 NVDA，据报道行业景气度回升",
+    ]
+
+    # round2 的跨句蹭标记回归：用真实的 _counterpoint() 构造，不是手写字面量。
+    leak_causes = [
+        {"source": "同行读数", "summary": "同行零售商本季度也遭遇打击，目标价 200 美元",
+         "item": None, "is_l1": False},
+        {"source": "新闻", "summary": "有分析人士评论称行业整体承压",
+         "item": None, "is_l1": False},
+    ]
+    B_BAN.append(AL._counterpoint(leak_causes))
+
+    print(f"\n  A 组（必须放行，共 {len(A_ALLOW)} 条）")
+    a_fail = 0
+    for s in A_ALLOW:
+        try:
+            AL.assert_no_directives(s)
+            print(f"    ✅ {s}")
+        except ValueError as e:
+            print(f"    ❌ 误伤 —— {s!r}：{e}")
+            FAIL.append(f"验收误伤 {s}")
+            a_fail += 1
+
+    print(f"\n  B 组（必须拦下，共 {len(B_BAN)} 条）")
+    b_fail = 0
+    for s in B_BAN:
+        try:
+            AL.assert_no_directives(s)
+            print(f"    ❌ 漏网 —— {s!r}")
+            FAIL.append(f"验收漏网 {s}")
+            b_fail += 1
+        except ValueError:
+            print(f"    ✅ {s}")
+
+    print(f"\n  验收结果：A 组 {len(A_ALLOW)-a_fail}/{len(A_ALLOW)} 零误伤，"
+          f"B 组 {len(B_BAN)-b_fail}/{len(B_BAN)} 零漏网")
+
+
 if __name__ == "__main__":
     test_banned_directives()
     test_allowed_factual_statements()
@@ -435,6 +574,8 @@ if __name__ == "__main__":
     test_extra_marker_is_scoped_not_global()
     test_short_markers_do_not_leak_via_substring()
     test_noun_suffix_exemption_for_gai_mai()
+    test_comma_bypass_position_based_exemption()
+    test_comprehensive_ab_matrix()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
