@@ -80,10 +80,26 @@ CREATE TABLE IF NOT EXISTS source_health (
   ts TEXT, source TEXT, ok INTEGER, latency_ms INTEGER, detail TEXT
 );
 
+-- 推送队列：「算」和「发」之间的唯一接口。
+-- compute 任务只入队不发送；notify 任务到点了统一 drain。
+-- 拆开的好处见设计文档 §2.1 —— 硬崩溃能被独立任务发现，try/except 做不到。
+CREATE TABLE IF NOT EXISTS outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT,
+  kind TEXT,           -- daily | weekly | l1 | failure
+  priority TEXT,       -- low | default | high | urgent
+  title TEXT,
+  body TEXT,
+  sent_at TEXT,        -- NULL = 未发送
+  attempts INTEGER DEFAULT 0,
+  last_error TEXT
+);
+
 CREATE INDEX IF NOT EXISTS ix_prices_ticker ON prices(ticker);
 CREATE INDEX IF NOT EXISTS ix_reddit_ticker ON reddit_rank(ticker);
 CREATE INDEX IF NOT EXISTS ix_filings_ticker ON edgar_filings(ticker, filed_at);
 CREATE INDEX IF NOT EXISTS ix_signals_ticker ON signals(ticker, d);
+CREATE INDEX IF NOT EXISTS ix_outbox_unsent ON outbox(sent_at, created_at);
 """
 
 
@@ -146,7 +162,8 @@ class Store:
     def stats(self):
         out = {}
         for t in ["positions", "prices", "meta", "reddit_rank",
-                  "edgar_filings", "signals", "alerts", "reports", "source_health"]:
+                  "edgar_filings", "signals", "alerts", "reports",
+                  "outbox", "source_health"]:
             try:
                 out[t] = self.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
             except Exception:
