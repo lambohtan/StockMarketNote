@@ -295,11 +295,25 @@ def _next_steps(l1_causes, ticker):
 
 def render_alert(alert, holding=None):
     """六段格式的完整 Markdown（面板和报告用，可含金额）。"""
-    steps = "\n".join(f"  {i}. {s}" for i, s in enumerate(alert["next_steps"], 1))
     pos = alert.get("position", "—")
     if holding is not None and holding.cost_basis is not None:
         pos = (f"{pos}；成本 ${holding.cost_basis:,.2f}，"
                f"市值 ${holding.market_value:,.2f}")
+
+    # 修复轮 5：逐字段单独校验，不再拼接后整体跑一次。
+    #
+    # 归属标记的位置判据（修复轮 4）是"字段内"的语义——六段本来就是彼此
+    # 独立的问题（发生了什么/数据/历史基准率/反面观点/持仓现状/下一步），
+    # 互相之间不该共享归属上下文。如果拼接成一个字符串再整体校验，
+    # "反面观点"里出现的"分析师"会为"接下来看什么"里一句毫不相关的裸
+    # 指令背书——这正是复审用六段格式本身构造出的攻击串暴露的问题。
+    for field in (alert["facts"], alert["data"], alert["base_rate"],
+                  alert["counterpoint"], pos):
+        assert_no_directives(field)
+    for step in alert["next_steps"]:
+        assert_no_directives(step)
+
+    steps = "\n".join(f"  {i}. {s}" for i, s in enumerate(alert["next_steps"], 1))
     md = (
         f"### 【{alert['level']}】{alert['ticker']} · {alert['category']}\n\n"
         f"**发生了什么**　{alert['facts']}\n\n"
@@ -309,7 +323,16 @@ def render_alert(alert, holding=None):
         f"**你的持仓现状**　{pos}\n\n"
         f"**接下来看什么**\n{steps}\n"
     )
-    assert_no_directives(md)
+    # 特意不再对拼接后的 md 整体跑 assert_no_directives：
+    # 逐字段校验通过意味着每个字段各自满足"归属在前"的位置关系，字段在
+    # md 里的相对顺序不会改变这个关系，整体再跑一次对归属位置判据这部分
+    # 是纯冗余，不会多拦下任何东西——保留只会制造"看起来多一层保护"的
+    # 错觉，而这层"保护"对本轮修的漏洞没有任何实际拦截力。
+    # 唯一需要留意的是字段拼接处会不会产生新的禁用子串（比如某字段结尾
+    # 是"建议"、下一字段开头是"买入"），但当前模板每两个字段之间都插着
+    # 展示用的中文标签和换行（"\n\n**数据**　"等），裸文本不会直接相邻，
+    # 这个风险目前不成立；以后如果改动模板去掉这些分隔标签，需要重新
+    # 评估，而不是指望一个"整体再跑一次"的假安全网。
     return md
 
 
@@ -318,7 +341,16 @@ def render_alert_push(alert):
     推送版：剥离一切金额（ntfy.sh 是公共服务器）。
     返回 (title, body)。
     """
-    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(alert["next_steps"][:3], 1))
+    push_steps = alert["next_steps"][:3]
+
+    # 逐字段单独校验，理由同 render_alert：六段互相独立，不共享归属上下文。
+    for field in (alert["facts"], alert["data"], alert["base_rate"],
+                  alert["counterpoint"]):
+        assert_no_directives(field)
+    for step in push_steps:
+        assert_no_directives(step)
+
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(push_steps, 1))
     title = f"【{alert['level']}】{alert['ticker']} · {alert['category']}"
     body = (
         f"发生了什么\n{alert['facts']}\n\n"
@@ -330,5 +362,6 @@ def render_alert_push(alert):
     # 兜底：把任何漏网的金额抹掉，绝不让它出网
     body = _MONEY.sub("[金额见面板]", body)
     title = _MONEY.sub("", title)
-    assert_no_directives(body)
+    # 不再对拼接后的 body 整体跑 assert_no_directives，理由同 render_alert——
+    # 逐字段校验已经更严格，整体再跑一次对归属位置判据是纯冗余。
     return title, body

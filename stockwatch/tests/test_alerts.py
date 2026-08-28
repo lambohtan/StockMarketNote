@@ -550,8 +550,107 @@ def test_comprehensive_ab_matrix():
         except ValueError:
             print(f"    ✅ {s}")
 
-    print(f"\n  验收结果：A 组 {len(A_ALLOW)-a_fail}/{len(A_ALLOW)} 零误伤，"
+    print(f"\n  验收结果（字符串级）：A 组 {len(A_ALLOW)-a_fail}/{len(A_ALLOW)} 零误伤，"
           f"B 组 {len(B_BAN)-b_fail}/{len(B_BAN)} 零漏网")
+
+    # 修复轮 5：跨字段攻击必须被拦下（render_alert / render_alert_push
+    # 级别，不是字符串级别的 assert_no_directives）——这是这轮修的漏洞，
+    # 收尾验收必须把它并进同一份表里，不能只在单独的测试函数里各自声称。
+    print("\n  跨字段攻击（必须拦下，render_alert / render_alert_push 各一次）")
+    cross_field_alert = {
+        "ticker": "WXYZ", "level": "L2", "category": "价格异动",
+        "facts": "个股独立部分超出常规波动范围",
+        "data": "股价当日 -3.2%（个股独立部分 -2.8%，2.6σ）",
+        "base_rate": "据分析师报告，历史上类似跌幅后续承压。",
+        "counterpoint": "本次未检索到明确的反面材料",
+        "position": "占卫星仓 3.1%",
+        "next_steps": ["建议减仓，等待财报明朗"],
+    }
+    cross_fail = 0
+    for fn, name in [(AL.render_alert, "render_alert(跨字段攻击)"),
+                      (AL.render_alert_push, "render_alert_push(跨字段攻击)")]:
+        try:
+            fn(cross_field_alert)
+            print(f"    ❌ 漏网 —— {name}")
+            FAIL.append(f"验收漏网(跨字段) {name}")
+            cross_fail += 1
+        except ValueError:
+            print(f"    ✅ {name}")
+
+    print("\n  单字段归属在前（必须放行，render_alert / render_alert_push 各一次）")
+    single_field_alert = {
+        "ticker": "WXYZ", "level": "L2", "category": "价格异动",
+        "facts": "个股独立部分超出常规波动范围",
+        "data": "股价当日 -3.2%（个股独立部分 -2.8%，2.6σ）",
+        "base_rate": "该类申报的历史基准率本系统尚未收录，以下判断请以原始申报文件为准。",
+        "counterpoint": "据报道，多家券商上调目标价",
+        "position": "占卫星仓 3.1%",
+        "next_steps": ["同行业其他公司同期的读数", "下一次财报的日期与市场一致预期"],
+    }
+    single_fail = 0
+    for fn, name in [(AL.render_alert, "render_alert(单字段归属)"),
+                      (AL.render_alert_push, "render_alert_push(单字段归属)")]:
+        try:
+            fn(single_field_alert)
+            print(f"    ✅ {name}")
+        except ValueError as e:
+            print(f"    ❌ 误伤 —— {name}：{e}")
+            FAIL.append(f"验收误伤(单字段) {name}")
+            single_fail += 1
+
+    print(f"\n  最终验收结果：字符串级 A 组 {len(A_ALLOW)-a_fail}/{len(A_ALLOW)} 零误伤，"
+          f"B 组 {len(B_BAN)-b_fail}/{len(B_BAN)} 零漏网；"
+          f"跨字段攻击 {2-cross_fail}/2 全部拦下；"
+          f"单字段归属 {2-single_fail}/2 全部放行")
+
+
+def test_cross_field_attribution_leak():
+    print("\n修复轮 5 · 跨字段攻击：一个字段的归属标记不能为另一个字段的指令背书")
+    # 复审的攻击串——它的形状就是六段格式本身：base_rate 里有合法归属
+    # （"据分析师报告"），next_steps 里是一句裸指令。round4 的位置判据是
+    # "字段内"的语义，如果拼接后整体校验，base_rate 的归属会为
+    # next_steps 里毫不相关的指令背书。
+    alert = {
+        "ticker": "WXYZ", "level": "L2", "category": "价格异动",
+        "facts": "个股独立部分超出常规波动范围",
+        "data": "股价当日 -3.2%（个股独立部分 -2.8%，2.6σ）",
+        "base_rate": "据分析师报告，历史上类似跌幅后续承压。",
+        "counterpoint": "本次未检索到明确的反面材料",
+        "position": "占卫星仓 3.1%",
+        "next_steps": ["建议减仓，等待财报明朗"],
+    }
+    for fn, name in [(AL.render_alert, "render_alert"),
+                      (AL.render_alert_push, "render_alert_push")]:
+        try:
+            fn(alert)
+            print(f"  ❌ 漏网：{name}() 没有拦下跨字段攻击")
+            FAIL.append(f"漏网(跨字段) {name}")
+        except ValueError:
+            print(f"  ✅ 拦下：{name}() 正确识别跨字段攻击（不被 base_rate 的归属背书）")
+
+
+def test_single_field_attribution_still_allowed():
+    print("\n修复轮 5 · 单字段内归属在前仍要放行（逐字段校验不能矫枉过正）")
+    # counterpoint 单独作为一个字段时，"据报道，多家券商上调目标价"
+    # 本身归属在前、合法，其余字段没有任何裸露的豁免短语——整条应该
+    # 正常渲染，不应该被"逐字段更严格"误伤成处处过敏。
+    alert = {
+        "ticker": "WXYZ", "level": "L2", "category": "价格异动",
+        "facts": "个股独立部分超出常规波动范围",
+        "data": "股价当日 -3.2%（个股独立部分 -2.8%，2.6σ）",
+        "base_rate": "该类申报的历史基准率本系统尚未收录，以下判断请以原始申报文件为准。",
+        "counterpoint": "据报道，多家券商上调目标价",
+        "position": "占卫星仓 3.1%",
+        "next_steps": ["同行业其他公司同期的读数", "下一次财报的日期与市场一致预期"],
+    }
+    for fn, name in [(AL.render_alert, "render_alert"),
+                      (AL.render_alert_push, "render_alert_push")]:
+        try:
+            fn(alert)
+            print(f"  ✅ 放行：{name}() 正常渲染")
+        except ValueError as e:
+            print(f"  ❌ 误伤：{name}() —— {e}")
+            FAIL.append(f"误伤(单字段) {name}")
 
 
 if __name__ == "__main__":
@@ -575,6 +674,8 @@ if __name__ == "__main__":
     test_short_markers_do_not_leak_via_substring()
     test_noun_suffix_exemption_for_gai_mai()
     test_comma_bypass_position_based_exemption()
+    test_cross_field_attribution_leak()
+    test_single_field_attribution_still_allowed()
     test_comprehensive_ab_matrix()
     print("\n" + "=" * 50)
     if FAIL:
