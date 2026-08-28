@@ -12,3 +12,4 @@ stockwatch/uploads/*
 .superpowers/
 # 生成的报告
 stockwatch/reports/*.md
+.DS_Store
