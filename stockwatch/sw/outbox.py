@@ -6,10 +6,28 @@
 独立的 notify 任务照样能发现「今天该有的条目没有」并上报 ——
 try/except 抓不到这类失败。
 
-并发安全（claim/release 原语）：
-  run_daily 和 run_notify 是两个不同的 launchd Label，Mac 睡过头时会并发补跑。
-  claim() 是原子领取（返回 True/False），确保同一条不会被多个进程推送。
-  如果失败可以 release() 退回。
+并发安全（claim/release 原语，Task 3 发送逻辑应该这样用）：
+  run_daily（跑完发现已过推送点会自 drain）和 run_notify（08:00 定时 drain）
+  是两个不同的 launchd Label。Mac 从 06:00 睡到 08:30 唤醒后，launchd 会同时
+  补跑两者 —— 并发窗口真实存在，不是理论风险。
+
+  正确用法：
+      token = claim(store, entry_id)
+      if token is None:
+          continue  # 没领到，别人已经在处理或已发送，直接跳过
+      try:
+          真正发送(entry)
+      except Exception as e:
+          release(store, entry_id, token)   # 发送失败，退回队列等下次重试
+          mark_failed(store, entry_id, e)
+
+  claim() 返回一个「令牌」（写入的时间戳字符串）而不是简单的 True/False，
+  是为了让 release() 能校验归属：release 必须带着 claim() 给的那个令牌，
+  SQL 层面用 `WHERE sent_at=?` 校验，确保只能归还「自己刚领到、还没发成功」
+  的那一条。如果没有这层校验，一次误用（比如发送成功后误调 release，或者对
+  自己没 claim 到的 id 调 release）就会把一条已经真实推送成功的条目打回队列，
+  下次 drain 再推一遍 —— 这正是 claim/release 本来要根治的重复推送问题，
+  只是换了个入口。
 """
 from datetime import datetime
 
@@ -37,11 +55,17 @@ def unsent(store):
                    "ORDER BY created_at, id")
 
 
-def mark_sent(store, entry_id):
-    """标记已发送。重复调用是安全的 —— 补跑竞态下这会真实发生。"""
+def mark_sent(store, entry_id, ts=None):
+    """标记已发送。重复调用是安全的 —— 补跑竞态下这会真实发生。
+
+    ts：仅供测试注入固定时间戳，用来在不依赖时钟分辨率的前提下断言
+    「第二次调用不会覆盖第一次写入的 sent_at」。生产代码不传，走默认的
+    当前时间。
+    """
+    ts = ts or datetime.now().isoformat(timespec="seconds")
     with store.tx() as c:
         c.execute("UPDATE outbox SET sent_at=? WHERE id=? AND sent_at IS NULL",
-                  (datetime.now().isoformat(timespec="seconds"), entry_id))
+                  (ts, entry_id))
 
 
 def mark_failed(store, entry_id, err):
@@ -61,21 +85,33 @@ def has_kind_on(store, kind, d):
 
 def claim(store, entry_id):
     """
-    原子领取一条待发条目。返回 True 表示本次调用领到了，False 表示已被别人领走。
+    原子领取一条待发条目。领到返回令牌（写入的时间戳字符串），没领到返回 None。
 
-    并发场景：run_daily（过推送点自 drain）和 run_notify（定时 drain）是两个
-    不同的 launchd Label，Mac 睡过头唤醒后会同时补跑。靠 UPDATE ... WHERE
-    sent_at IS NULL 的 rowcount 判断谁赢，输的一方直接跳过，不会重复推送。
+    并发场景：run_daily（跑完发现已过推送点会自 drain）和 run_notify（08:00 定时）
+    是两个不同的 launchd Label，Mac 睡过头唤醒后 launchd 会同时补跑两者。
+    靠 UPDATE ... WHERE sent_at IS NULL 的 rowcount 判断谁赢，输的一方拿到 None 直接跳过。
+
+    返回令牌而不是 bool，是为了让 release() 能校验归属 —— 否则 release 可能把
+    一条已经真实发送成功的条目打回队列，从另一个入口重新制造重复推送。
     """
     ts = datetime.now().isoformat(timespec="seconds")
     with store.tx() as c:
         cur = c.execute(
             "UPDATE outbox SET sent_at=? WHERE id=? AND sent_at IS NULL",
             (ts, entry_id))
-        return cur.rowcount == 1
+        return ts if cur.rowcount == 1 else None
 
 
-def release(store, entry_id):
-    """发送失败时归还领取，让下次 drain 能重试。"""
+def release(store, entry_id, token):
+    """
+    发送失败时归还领取，让下次 drain 能重试。
+
+    token 必须是本次 claim() 返回的那个值。带 token 校验（WHERE sent_at=?）
+    确保只能归还自己领到的那一条 —— 对未 claim 的、或已被别人处理的条目调用本函数
+    不会有任何效果。返回是否真的归还了。
+    """
     with store.tx() as c:
-        c.execute("UPDATE outbox SET sent_at=NULL WHERE id=?", (entry_id,))
+        cur = c.execute(
+            "UPDATE outbox SET sent_at=NULL WHERE id=? AND sent_at=?",
+            (entry_id, token))
+        return cur.rowcount == 1

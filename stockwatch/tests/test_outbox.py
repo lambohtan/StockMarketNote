@@ -42,15 +42,17 @@ def test_idempotent_send():
     print("\n幂等：标记已发后不再出现在未发送队列")
     st = fresh_store()
     i1 = OB.enqueue(st, "daily", "T", "B")
-    OB.mark_sent(st, i1)
+    # 用两个明确不同的时间戳注入，不依赖 datetime.now() 的秒级分辨率——
+    # 否则两次调用大概率落在同一秒，"时间戳没变"这条断言会恒真，测不出问题。
+    OB.mark_sent(st, i1, ts="2026-08-27T06:00:00")
     check("标记后队列为空", OB.unsent(st), [])
-    # 记下第一次 mark_sent 后的时间戳
     first_sent_at = st.q("SELECT sent_at FROM outbox WHERE id=?", (i1,))[0]["sent_at"]
-    OB.mark_sent(st, i1)          # 重复标记不能炸
+    check("sent_at 写入了第一次的时间戳", first_sent_at, "2026-08-27T06:00:00")
+    OB.mark_sent(st, i1, ts="2026-08-27T08:00:00")   # 重复标记，且时间戳明显不同
     check("重复标记仍为空", OB.unsent(st), [])
-    # 检查时间戳未被改写（真正的幂等性）
+    # 如果 SQL 里去掉 AND sent_at IS NULL，这里会被改写成第二次传入的时间戳，测试就会变红
     second_sent_at = st.q("SELECT sent_at FROM outbox WHERE id=?", (i1,))[0]["sent_at"]
-    check("sent_at 时间戳幂等", first_sent_at, second_sent_at)
+    check("sent_at 未被第二次调用覆盖", second_sent_at, first_sent_at)
     st.close()
 
 
@@ -84,12 +86,13 @@ def test_has_kind_on():
 
 
 def test_claim_is_exclusive():
-    print("\n并发安全：claim 是原子的，第二次 claim 返回 False")
+    print("\n并发安全：claim 是原子的，第二次 claim 拿不到令牌")
     st = fresh_store()
     i1 = OB.enqueue(st, "daily", "T", "B")
-    check("第一次 claim 成功", OB.claim(st, i1), True)
+    token = OB.claim(st, i1)
+    check("第一次 claim 领到了令牌（非 None）", token is not None, True)
     check("claim 后队列为空", OB.unsent(st), [])
-    check("第二次 claim 失败", OB.claim(st, i1), False)
+    check("第二次 claim 失败", OB.claim(st, i1), None)
     st.close()
 
 
@@ -97,12 +100,12 @@ def test_release_puts_it_back():
     print("\n失败恢复：release 后条目重新进入队列")
     st = fresh_store()
     i1 = OB.enqueue(st, "daily", "T", "B")
-    OB.claim(st, i1)
+    token = OB.claim(st, i1)
     check("claim 后队列为空", OB.unsent(st), [])
-    OB.release(st, i1)
+    check("release 用正确令牌应该成功", OB.release(st, i1, token), True)
     rows = OB.unsent(st)
     check("release 后条目回队", len(rows), 1)
-    check("可以再次 claim", OB.claim(st, i1), True)
+    check("可以再次 claim", OB.claim(st, i1) is not None, True)
     st.close()
 
 
@@ -118,6 +121,21 @@ def test_claim_does_not_touch_others():
     st.close()
 
 
+def test_release_rejects_wrong_token():
+    print("\n归属校验：伪造的令牌不能把条目打回队列")
+    st = fresh_store()
+    i1 = OB.enqueue(st, "daily", "T", "B")
+    token = OB.claim(st, i1)
+    check("claim 后队列为空", OB.unsent(st), [])
+    fake_token = "1999-01-01T00:00:00"  # 伪造的令牌，肯定不等于真实 token
+    check("伪造令牌不等于真实令牌（前提）", fake_token != token, True)
+    check("用伪造令牌 release 应该失败", OB.release(st, i1, fake_token), False)
+    # 关键断言：条目没有被打回队列 —— 这条已经"发送成功"的条目不能因为
+    # 别人一次误用（对没 claim 到的 id、或已发送成功的 id 调 release）就重新出队。
+    check("条目仍未回到队列", OB.unsent(st), [])
+    st.close()
+
+
 if __name__ == "__main__":
     test_enqueue_and_unsent()
     test_idempotent_send()
@@ -126,6 +144,7 @@ if __name__ == "__main__":
     test_claim_is_exclusive()
     test_release_puts_it_back()
     test_claim_does_not_touch_others()
+    test_release_rejects_wrong_token()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
