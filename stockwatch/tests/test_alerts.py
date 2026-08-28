@@ -283,6 +283,70 @@ def test_scan_z_none_no_crash():
         FAIL.append(f"scan() z=None 崩溃: {e!r}")
 
 
+def test_attribution_exemption_is_per_sentence_not_whole_text():
+    print("\n修复轮 2 · 归属豁免必须按句子边界判断，不能被别的句子的归属标记蹭到")
+    # 用真实的 _counterpoint() 构造：同行读数（裸露的「目标价」，本句没有归属标记）
+    # + 新闻转述（有「报道」标记），用「；」拼接——这正是 _counterpoint() 真实会
+    # 产出的形状，也是 Task 7 接入 LLM 后 counterpoint 字段的典型来源。
+    causes = [
+        {"source": "同行读数", "summary": "同行零售商本季度也遭遇打击，目标价 200 美元",
+         "item": None, "is_l1": False},
+        {"source": "新闻", "summary": "有分析人士评论称行业整体承压",
+         "item": None, "is_l1": False},
+    ]
+    cp = AL._counterpoint(causes)
+    expected = ("同行零售商本季度也遭遇打击，目标价 200 美元；"
+                "另有报道：有分析人士评论称行业整体承压")
+    check("_counterpoint() 拼接形状符合预期", cp, expected)
+    try:
+        AL.assert_no_directives(cp)
+        print(f"  ❌ 漏网：前半句裸露的「目标价」蹭到了后半句的「报道」标记 —— {cp!r}")
+        FAIL.append("跨句蹭标记漏网")
+    except ValueError:
+        print("  ✅ 拦下：前半句「目标价」在本句内没有归属标记，不受后半句「报道」影响")
+
+
+def test_transactional_price_phrases():
+    print("\n修复轮 2 · 买入价/卖出价/建议减/该卖出 的同类误伤压力测试")
+    ALLOWED = [
+        "该笔交易的买入价区间为 45 至 48 美元",
+        "审计函建议减少对单一供应商的依赖",
+        "该卖出方为公司前董事",
+    ]
+    for s in ALLOWED:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ✅ 放行：{s}")
+        except ValueError as e:
+            print(f"  ❌ 误伤：{s!r} —— {e}")
+            FAIL.append(f"误伤(交易转述) {s}")
+
+    BANNED = [
+        "你的买入价应该设在 180",
+        "建议减仓至 3%",
+    ]
+    for s in BANNED:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ❌ 漏网：{s!r}")
+            FAIL.append(f"漏网(交易) {s}")
+        except ValueError:
+            print(f"  ✅ 拦下：{s!r}")
+
+
+def test_extra_marker_is_scoped_not_global():
+    print("\n修复轮 2 · 「交易」类专属标记只对买入价/卖出价生效，不能被建议买入借用")
+    # 「建议买入」是高风险短语——如果「交易」这种专属标记被错误地放进通用表，
+    # 这句会被误放行，等于系统自己在下单指令还蹭着「交易」两个字免检。
+    s = "建议买入该交易标的 NVDA"
+    try:
+        AL.assert_no_directives(s)
+        print(f"  ❌ 漏网：「交易」标记被「建议买入」借用了 —— {s!r}")
+        FAIL.append(f"漏网(专属标记越界) {s}")
+    except ValueError:
+        print(f"  ✅ 拦下：{s!r}（「交易」不是「建议买入」的有效归属标记）")
+
+
 if __name__ == "__main__":
     test_banned_directives()
     test_allowed_factual_statements()
@@ -298,6 +362,9 @@ if __name__ == "__main__":
     test_scan_anomaly_without_l1_cause_is_l2()
     test_scan_normal_not_included()
     test_scan_z_none_no_crash()
+    test_attribution_exemption_is_per_sentence_not_whole_text()
+    test_transactional_price_phrases()
+    test_extra_marker_is_scoped_not_global()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
