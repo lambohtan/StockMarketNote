@@ -105,13 +105,18 @@ def test_cross_sentence_attack_on_guard():
     """
     Task 7 验收条件：Task 6 上限轮裁定的已知残留 —— 单字段内「先归属、
     远处夹带指令」的长句能绕过 assert_no_directives（归属标记远早于豁免
-    短语、且中间跨过一个完整句号）。
+    短语、且中间跨过一个完整句号，或隔了好几个逗号分句）。
 
     这里用「模拟 LLM 摘要输出的形状」（两句话以内：先转述一个归属来源，
     再滑出到指令语气）红队 LM._guard()——它就是 summarize() 真正会走的
-    守卫路径。加固前跑这条测试会全部漏网（已用 git stash 验证过，见
-    task-7-report.md）；sw/alerts.py 加了邻近性上限（字符距离 + 句末标点）
-    之后，下面全部样本必须被拦下。
+    守卫路径。加固前跑这条测试会全部漏网（见 task-7-report.md 的过程记录）；
+    sw/alerts.py 改用"子句邻接"（软分隔符个数上限 + 硬分隔符不能跨）之后，
+    下面全部样本必须被拦下。
+
+    修复轮 1：审查者指出第一版"字符距离上限"是摆设（把常数从 20 改到 100
+    两个测试套件都全绿），并且用"归属，无关填充，无关填充，真指令"这种
+    多逗号分句的攻击绕了过去——后两条就是那次审查构造的真实绕过样本，
+    补进来防止同样的绕过再次发生。
     """
     print("\n跨句攻击压测：模拟 LLM 摘要输出（两句话以内，先归属后指令）")
     ATTACKS = [
@@ -124,6 +129,10 @@ def test_cross_sentence_attack_on_guard():
         # 铺垫极短的变体：纯字符距离判据挡不住，必须靠句末标点判据补
         "据悉大涨。建议买入。",
         "据悉行业景气度回升。建议加仓。",
+        # 修复轮 1 · 审查者构造的真实绕过：没有句号，纯靠多个逗号分句拉开
+        # 距离——验证的是"软分隔符个数上限"这条判据，不是句号判据
+        "据悉，市场情绪偏紧张，建议加仓",
+        "据悉，公司近期出现明显异动，情绪偏紧张，建议加仓",
     ]
     for s in ATTACKS:
         try:
@@ -134,6 +143,47 @@ def test_cross_sentence_attack_on_guard():
             print(f"  ✅ 拦下：{s!r}")
 
 
+class FakeStore:
+    """测试用假 store：只记录 log_health 的调用，不碰真数据库。"""
+    def __init__(self):
+        self.calls = []
+
+    def log_health(self, source, ok, latency_ms, detail=""):
+        self.calls.append((source, ok, latency_ms, detail))
+
+
+def test_guard_violation_is_logged():
+    """
+    Task 7 修复轮 1（Important 提级为必修）：守卫触发的 ValueError 之前被
+    summarize() 外层的 except Exception 静默吞掉、退化成空字符串，没有任何
+    日志。如果 LLM 持续产出违规摘要，运维侧完全看不到信号。
+
+    _guard_or_log() 是这个问题的修法：触发时记一条 source_health
+    （source="llm.guard"，ok=False，detail 里带被拦短语和摘要前 100 字），
+    没有 store 就退化为打印到 stderr——两条路径都不能崩、也不能真的沉默。
+    """
+    print("\n守卫触发必须可见：记 source_health，而不是静默吞掉")
+    store = FakeStore()
+    out = LM._guard_or_log("建议卖出该持仓", store)
+    check("触发时返回空字符串（不中断任务）", out, "")
+    check("恰好记了一条 source_health", len(store.calls), 1)
+    if store.calls:
+        source, ok, latency_ms, detail = store.calls[0]
+        check("source 是 llm.guard", source, "llm.guard")
+        check("ok=False", ok, False)
+        check("detail 里带着被拦短语", "建议卖出" in detail, True)
+
+    print("\n没有 store 时退化为打印到 stderr（launchd 会写进 StandardErrorPath）")
+    out2 = LM._guard_or_log("建议买入 NVDA", None)
+    check("退化路径也返回空字符串", out2, "")
+
+    print("\n客观陈述不触发日志")
+    store2 = FakeStore()
+    out3 = LM._guard_or_log("内部人集中卖出，共 3 笔", store2)
+    check("客观陈述原样返回", out3, "内部人集中卖出，共 3 笔")
+    check("没有记 source_health", len(store2.calls), 0)
+
+
 if __name__ == "__main__":
     test_api_key_conflict_is_fatal()
     test_api_mode_without_key_is_fatal()
@@ -142,6 +192,7 @@ if __name__ == "__main__":
     test_dry_run_returns_placeholder_and_calls_nothing()
     test_output_passes_directive_guard()
     test_cross_sentence_attack_on_guard()
+    test_guard_violation_is_logged()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")

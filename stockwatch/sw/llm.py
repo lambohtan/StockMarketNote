@@ -17,6 +17,7 @@ LLM adapter —— 全流程唯一用 LLM 的地方。
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from .alerts import assert_no_directives
@@ -55,6 +56,27 @@ def _guard(text):
     return text
 
 
+def _guard_or_log(text, store):
+    """
+    过守卫；触发时记一条 source_health，而不是和"调用失败"混在一起静默吞掉。
+
+    Task 7 修复轮 1（Important 提级为必修）：守卫是兜底，不是安全边界——对抗式
+    绕过不可能穷尽。真正的保障不是把守卫堆到无懈可击，而是让"LLM 反复产出
+    违规摘要"这件事可见。如果没有 store（比如调用方还没接入，或测试环境），
+    退化为打印到 stderr——launchd 会把 stderr 写进 StandardErrorPath，
+    不会真的消失。
+    """
+    try:
+        return _guard(text)
+    except ValueError as e:
+        detail = f"{e}｜摘要前100字：{text[:100]!r}"
+        if store is not None:
+            store.log_health("llm.guard", False, 0, detail)
+        else:
+            print(f"[llm.guard] 守卫拦下 LLM 输出：{detail}", file=sys.stderr)
+        return ""
+
+
 def build_cli_cmd(cfg, instruction):
     """拼 claude -p 的命令行。单独抽出来是为了能测。"""
     claude_bin = cfg.get("llm.claude_bin") or DEFAULT_CLAUDE_BIN
@@ -79,13 +101,34 @@ SYSTEM = (
 )
 
 
-def summarize(cfg, material, instruction=None, dry_run=False, timeout=120):
-    """把材料压成一两句人话。失败返回空字符串，绝不中断整个任务。"""
+def summarize(cfg, material, instruction=None, dry_run=False, timeout=120, store=None):
+    """
+    把材料压成一两句人话。失败返回空字符串，绝不中断整个任务。
+
+    ⚠️ 例外：check_env() 触发的 LLMConfigError **不会**被这里吞掉，会直接
+    冒泡给调用方。这是有意设计，跟"LLM 调用失败返回空字符串"字面上有张力，
+    但两者是不同性质的问题：
+      - 配置错误（provider 冲突、缺 key、未知 provider）是开发/运维配置
+        错误，必须尽早暴露、阻止任务继续——放过去不会"优雅降级"，只会变成
+        "报告里莫名其妙少一段"，排查起来更难，还可能在没人注意的情况下
+        持续按 API 计费。
+      - 运行时失败（网络、超时、CLI 非零退出、JSON 解析失败等）才是"绝不
+        中断整个任务"这条规则要覆盖的场景——这类失败是环境噪音，不代表
+        配置本身错了，值得静默降级、明天再试。
+    调用方（Task 9/10/11 的 run_daily.py 等）需要在最外层单独捕获
+    LLMConfigError 并让任务失败得响亮，不能和其它异常一起吞掉。
+
+    store：可选，传入后守卫触发（LLM 输出含指令性措辞）时会记一条
+    source_health（source="llm.guard"），没传就退化为打印到 stderr。
+    这跟"调用失败"是两回事——守卫触发说明 LLM 拿到材料并且回话了，只是
+    回话内容违规，运维需要看到这个信号，而不是和网络超时之类的调用失败
+    混在一起，一律变成空字符串、无迹可寻。
+    """
     instruction = f"{SYSTEM}\n\n{instruction or ''}".strip()
     if dry_run:
         return f"[dry-run] 将把 {len(material)} 字材料交给 LLM 摘要"
 
-    check_env(cfg)
+    check_env(cfg)  # LLMConfigError 不在这里捕获，直接冒泡（见上方 docstring）
     provider = cfg.get("llm.provider", "claude_cli")
 
     if provider == "claude_cli":
@@ -97,9 +140,10 @@ def summarize(cfg, material, instruction=None, dry_run=False, timeout=120):
             if p.returncode != 0:
                 return ""
             data = json.loads(p.stdout)
-            return _guard((data.get("result") or "").strip())
+            result = (data.get("result") or "").strip()
         except Exception:
             return ""
+        return _guard_or_log(result, store)
 
     # provider == "api"
     try:
@@ -112,6 +156,7 @@ def summarize(cfg, material, instruction=None, dry_run=False, timeout=120):
             messages=[{"role": "user", "content": material}],
         )
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        return _guard(text.strip())
+        result = text.strip()
     except Exception:
         return ""
+    return _guard_or_log(result, store)
