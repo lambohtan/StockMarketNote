@@ -7,9 +7,11 @@
 """
 import sys, tempfile, json
 from pathlib import Path
+from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sw.store import Store
 from sw.analysis import causes as CS
+from sw.sources import edgar_src as E
 
 FAIL = []
 
@@ -98,12 +100,43 @@ def test_peer_readthrough_distinguishes_sector_event():
     check("只有自己在动 → 不是行业性", r2["looks_sector_wide"], False)
 
 
+def test_matches_row_shaped_like_fetch_filings_for_tickers():
+    """
+    修复轮 1：全市场 EDGAR 索引不带 ticker/items（已用真实请求核实），
+    causes.py 实际会消费的是 edgar_src.fetch_filings_for_tickers() 产出的行。
+    这里不发网络请求，只是用 _assemble_row（行组装的纯函数）模拟一条
+    真实结构的 filing（ticker 非空、items 是逗号分隔的多个编号），
+    确认它写进库之后 find_causes 能正确匹配、正确识别 L1、正确取第一个 item。
+    """
+    print("\n真实结构的行（ticker + 多个 items）应能被 find_causes 匹配")
+    fake_filing = SimpleNamespace(
+        accession_no="0000320193-26-000018",
+        filing_date="2026-08-27",
+        items="7.01,5.02",          # 非 L1 item 排在前，L1 item 排在后 —— any() 该认得
+        cik="320193",
+        filing_url="https://www.sec.gov/Archives/edgar/data/320193/000032019326000018/",
+        company="Apple Inc.",
+    )
+    row = E._assemble_row(fake_filing, "8-K", "2026-08-27T09:00:00", ticker="AAPL")
+    st = fresh_store()
+    st.upsert_many("edgar_filings",
+                   ["accession", "filed_at", "ticker", "cik", "form",
+                    "items", "url", "raw_json", "seen_at"], [row])
+    got = CS.find_causes(st, "AAPL", "2026-08-27", peers=None, max_news=0)
+    check("找到 1 条", len(got), 1)
+    check("标为 L1（items 里含 5.02 即可，不要求排在第一）", got[0]["is_l1"], True)
+    check("item 取第一个", got[0]["item"], "7.01")
+    check("摘要含两个 item 的中文释义", "高管" in got[0]["summary"] and "Regulation FD" in got[0]["summary"], True)
+    st.close()
+
+
 if __name__ == "__main__":
     test_finds_8k_and_marks_l1()
     test_non_l1_item_not_marked()
     test_honest_empty_when_nothing_found()
     test_only_looks_at_recent_window()
     test_peer_readthrough_distinguishes_sector_event()
+    test_matches_row_shaped_like_fetch_filings_for_tickers()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
