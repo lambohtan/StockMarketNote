@@ -234,6 +234,115 @@ def test_attribute_respects_min_obs_on_common_dates():
         FAIL.append(f"共同交易日凑够 {n_ok} 天（=MIN_OBS）时应放行")
 
 
+def test_gap_in_ticker_series_is_not_folded():
+    """个股自己缺一天报价，不能被静默折叠成"这天的收益率是两天的累计涨跌"。
+
+    真实场景：某天个股的数据源抓取失败（source_health 机制预期会发生、
+    也会容忍的常态，不是假设），SPY/XLK 当天照常有报价。如果对齐逻辑只看
+    "个股自己的日期序列里两行相邻"，就会把跨过缺口的两天累计涨跌当成一天
+    的收益率，和同一天 SPY/XLK 的单日收益率错位比较——可能凭空造出异动，
+    也可能把真正发生在缺口那天的异动完全稀释掉，而且全程不报错。
+
+    构造：60 天合成序列，删掉个股在 dates[-2] 的报价行，SPY/XLK 那天
+    照常有数据。断言（二选一都算通过，哪个都不行才算真的出问题）：
+    1. dates[-2]、dates[-1] 都因为缺口被跳过（出现在 skipped_days 里），
+       归因引擎回退到缺口之前最后一个干净的交易日 dates[-3]；或者
+    2. 如果 dates[-1] 真的被当成"当日"用了，它的收益率必须仍然是
+       该日的真实单日收益，绝不能等于跨过缺口的两日累计收益——
+       这是本测试要卡死的红线，也是"对齐逻辑改回按个股自己日期算"
+       这个变异必须触发的失败点。
+    """
+    print("\n个股缺口不能被折叠成两日累计收益")
+    rng = np.random.default_rng(2026)
+    n = 60
+    dates = [f"2026-04-{i:04d}" for i in range(n + 1)]
+    mkt_ret = rng.normal(0, 0.010, n)
+    sec_ret = rng.normal(0, 0.008, n)
+    stock_ret = 1.0 * mkt_ret + 0.5 * sec_ret + rng.normal(0, 0.003, n)
+
+    ticker_rows = _prices_from_returns(dates, stock_ret)
+    market_rows = _prices_from_returns(dates, mkt_ret)
+    sector_rows = _prices_from_returns(dates, sec_ret)
+
+    gap_date = dates[-2]                        # 个股在这天"数据源抓取失败"
+    px_by_date = dict(ticker_rows)               # 留着算真实值，供对照（不喂给假 Store）
+    ticker_rows_with_gap = [(d, c) for d, c in ticker_rows if d != gap_date]
+
+    rows = {"TICK": ticker_rows_with_gap, "SPY": market_rows, "XLK": sector_rows}
+    store = _FakeStore(rows)
+
+    r = AT.attribute(store, "TICK", "XLK", market_etf="SPY", window=n, start=dates[0])
+    if r is None:
+        FAIL.append("缺口场景意外返回 None（样本量或测试构造有问题）")
+        print("  ❌ 缺 1 天后意外返回 None")
+        return
+    print(f"  （自查：dates[-3]={dates[-3]}，dates[-2]={dates[-2]}（缺口），"
+          f"dates[-1]={dates[-1]}；归因回来的当日 r['d']={r['d']}）")
+
+    check_eq("缺口当天（dates[-2]）被记入 skipped_days", gap_date in r["skipped_days"], True)
+    check_eq("缺口后一天（dates[-1]）也被记入 skipped_days", dates[-1] in r["skipped_days"], True)
+
+    folded_2day_ret = px_by_date[dates[-1]] / px_by_date[dates[-3]] - 1.0
+
+    if r["d"] == dates[-1]:
+        # dates[-1] 被当作当日用了：它的收益率必须是真实单日收益，
+        # 不能是折叠了缺口那天的两日累计收益。
+        check("dates[-1] 被当作当日时，收益率必须是单日收益，不是折叠值",
+              r["ret"], float(stock_ret[-1]), 1e-9)
+        if abs(r["ret"] - folded_2day_ret) < 1e-9:
+            FAIL.append("dates[-1] 的收益率等于两日折叠值——缺口被静默折叠了")
+            print(f"  ❌ 收益率 {r['ret']:.6f} 等于两日折叠值 {folded_2day_ret:.6f}"
+                  f"——缺口被静默折叠了")
+    else:
+        # 更合理也是本实现的做法：dates[-1] 因前一天缺口直接被丢弃，
+        # "当日"回退到缺口之前最后一个干净的交易日 dates[-3]。
+        check_eq("dates[-1] 因缺口被丢弃，当日回退到 dates[-3]", r["d"], dates[-3])
+        check("回退到 dates[-3] 后，收益率是它自己的真实单日收益",
+              r["ret"], float(stock_ret[-3]), 1e-9)
+
+
+def test_attribute_sector_etf_none_degrades_to_single_factor():
+    """sector_etf=None（行业未知，真实生产路径——VOO/QQQ 在 meta 表里
+    sector 是 None，run_daily 会用 sector_map.get(h.sector) if h.sector
+    else None 传 None 进来）时，必须精确退化成单因子 OLS：
+    β_行业恒为 0，α/β_市场/R² 与直接对 (y, mkt) 做单因子回归完全一致——
+    不能为了凑双因子硬塞一个不相关的代理。之前这条路径没有任何测试覆盖。
+    """
+    print("\nsector_etf=None 退化为单因子（真实生产路径）")
+    rng = np.random.default_rng(99)
+    n = 80
+    dates = [f"2026-05-{i:04d}" for i in range(n + 1)]
+    mkt_ret = rng.normal(0, 0.010, n)
+    stock_ret = 1.25 * mkt_ret + rng.normal(0, 0.004, n)
+
+    rows = {
+        "TICK": _prices_from_returns(dates, stock_ret),
+        "SPY": _prices_from_returns(dates, mkt_ret),
+    }
+    store = _FakeStore(rows)
+
+    r = AT.attribute(store, "TICK", None, market_etf="SPY", window=n, start=dates[0])
+    if r is None:
+        FAIL.append("sector_etf=None 场景意外返回 None")
+        print("  ❌ 意外返回 None")
+        return
+
+    # 解析解：单因子 OLS y = a + b·mkt + e 的最小二乘闭式解，独立算一遍做锚。
+    X1 = np.column_stack([np.ones(n), mkt_ret])
+    coef1, *_ = np.linalg.lstsq(X1, stock_ret, rcond=None)
+    b_ref = float(coef1[1])
+    resid_ref = stock_ret - X1 @ coef1
+    ss_tot = float(np.sum((stock_ret - stock_ret.mean()) ** 2))
+    r2_ref = float(1 - np.sum(resid_ref ** 2) / ss_tot)
+
+    check_eq("β_行业恒为 0（没有为了凑双因子硬塞代理）", r["beta_sector"], 0.0)
+    check("β_市场与单因子 OLS 解析解一致", r["beta_mkt"], b_ref, 1e-9)
+    check("R² 与单因子 OLS 解析解一致", r["r2"], r2_ref, 1e-9)
+    check("sector_part 恒为 0", r["sector_part"], 0.0, 1e-12)
+    recon = r["mkt_part"] + r["sector_part"] + r["idio"]
+    check("三块拆解仍能加回当日收益", recon, r["ret"], 1e-9)
+
+
 if __name__ == "__main__":
     test_ols2_recovers_known_betas()
     test_detects_injected_shock()
@@ -242,6 +351,8 @@ if __name__ == "__main__":
     test_insufficient_data_returns_none()
     test_attribute_end_to_end_uses_out_of_sample_sigma()
     test_attribute_respects_min_obs_on_common_dates()
+    test_gap_in_ticker_series_is_not_folded()
+    test_attribute_sector_etf_none_degrades_to_single_factor()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")

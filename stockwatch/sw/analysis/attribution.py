@@ -55,14 +55,37 @@ def classify(z):
     return "normal"
 
 
-def _returns(store, ticker, start):
+def _prices(store, ticker, start):
+    """返回 {日期: 收盘价} —— 只是原始报价，不在这一层算收益率。
+
+    收益率要按「交易日历上相邻的两天」算，不能按「价格表里相邻的两行」算
+    （见 _calendar_returns 的说明），所以这里先只取价格，对齐交给上层。
+    """
     rows = store.q("SELECT d, close FROM prices WHERE ticker=? AND d>=? ORDER BY d",
                    (ticker, start))
-    ds = [r["d"] for r in rows]
-    px = np.array([float(r["close"]) for r in rows], float)
-    if len(px) < 2:
-        return [], np.zeros(0)
-    return ds[1:], px[1:] / px[:-1] - 1.0
+    return {r["d"]: float(r["close"]) for r in rows}
+
+
+def _calendar_returns(prices, cal):
+    """
+    按权威交易日历 cal 逐日计算收益率：只有当 cal 里相邻的两天
+    （不是价格表里随便相邻的两行）都能在 prices 里查到报价，才为后一天
+    生成一个收益率观测点；否则跳过那一天，不生成观测点。
+
+    ⚠️ 这里踩过一个真实的坑：原来的实现直接拿价格表里"相邻两行"算收益率，
+    从不检查这两行的日期是不是真的相邻。个股某天因数据源抓取失败缺一行
+    （source_health 机制预期会发生、也会容忍的常态，不是假设），下一行
+    记录的"单日收益"就会变成两天的累计收益，而同一天的 SPY/XLK 因子仍是
+    正常单日收益 —— 两者错位比较，会凭空造出异动、或者把真正发生在缺口
+    那天的异动完全稀释掉，而且全程没有任何报错。
+    改成按 cal 上的相邻日期算，缺口天直接不产出观测点，不会被静默折叠。
+    """
+    ret = {}
+    for i in range(1, len(cal)):
+        d_prev, d_cur = cal[i - 1], cal[i]
+        if d_prev in prices and d_cur in prices:
+            ret[d_cur] = prices[d_cur] / prices[d_prev] - 1.0
+    return ret
 
 
 def attribute(store, ticker, sector_etf, market_etf="SPY", window=60, start=None):
@@ -71,30 +94,41 @@ def attribute(store, ticker, sector_etf, market_etf="SPY", window=60, start=None
 
     sector_etf 为 None 时（行业未知、或是 ETF 本身）退化为单因子，
     b2 记 0 —— 不要为了凑双因子硬塞一个不相关的代理。
+
+    交易日历以 market_etf（默认 SPY）的报价日期为权威 —— 和
+    sw.analysis.risk.price_panel(anchor="SPY") 同一套模式，不发明第二套。
+    个股/行业序列只在日历上「相邻两天都有报价」时才生成一个收益率观测点，
+    某只序列的缺口天不会被静默折叠进下一天的收益率。
     """
     if start is None:
         from datetime import date, timedelta
         start = (date.today() - timedelta(days=int(window * 2.2) + 60)).isoformat()
 
-    d_t, r_t = _returns(store, ticker, start)
-    d_m, r_m = _returns(store, market_etf, start)
-    if len(r_t) == 0 or len(r_m) == 0:
+    px_t = _prices(store, ticker, start)
+    px_m = _prices(store, market_etf, start)
+    if len(px_t) < 2 or len(px_m) < 2:
         return None
+
+    cal = sorted(px_m.keys())           # 权威交易日历：SPY 的报价日期
+    r_t = _calendar_returns(px_t, cal)
+    r_m = _calendar_returns(px_m, cal)
 
     if sector_etf:
-        d_s, r_s = _returns(store, sector_etf, start)
+        px_s = _prices(store, sector_etf, start)
+        r_s = _calendar_returns(px_s, cal)
     else:
-        d_s, r_s = d_m, np.zeros(len(r_m))
+        r_s = {d: 0.0 for d in r_m}
 
-    # 只保留三者都有报价的交易日，避免个别停牌日制造假跳空
-    common = sorted(set(d_t) & set(d_m) & set(d_s))
-    if len(common) < MIN_OBS:
+    # 只保留三者都能在日历上生成有效收益率的交易日；
+    # 因为某只序列缺口而被排除的交易日记进 skipped_days，便于以后排查。
+    common_all = sorted(set(r_t) & set(r_m) & set(r_s))
+    if len(common_all) < MIN_OBS:
         return None
-    common = common[-window:]
-    mt, mm, ms = dict(zip(d_t, r_t)), dict(zip(d_m, r_m)), dict(zip(d_s, r_s))
-    y = np.array([mt[d] for d in common], float)
-    x1 = np.array([mm[d] for d in common], float)
-    x2 = np.array([ms[d] for d in common], float)
+    skipped_days = sorted(set(cal[1:]) - set(common_all))
+    common = common_all[-window:]
+    y = np.array([r_t[d] for d in common], float)
+    x1 = np.array([r_m[d] for d in common], float)
+    x2 = np.array([r_s[d] for d in common], float)
 
     fit = ols2(y, x1, x2)
     if fit is None:
@@ -122,4 +156,5 @@ def attribute(store, ticker, sector_etf, market_etf="SPY", window=60, start=None
         "n": fit["n"],
         "sector_etf": sector_etf,
         "market_etf": market_etf,
+        "skipped_days": skipped_days,
     }
