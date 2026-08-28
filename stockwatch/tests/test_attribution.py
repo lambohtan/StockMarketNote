@@ -54,7 +54,13 @@ def test_detects_injected_shock():
     sigma = 0.004
     mkt = rng.normal(0, 0.010, n)
     sec = rng.normal(0, 0.008, n)
-    y = 1.20 * mkt + 0.60 * sec + rng.normal(0, sigma, n)
+    noise = rng.normal(0, sigma, n)
+    # 把注入日自身的随机噪声清零，只留下我们要检验的 3σ 冲击 ——
+    # 否则那天自己的噪声draw会和注入的冲击叠加/抵消（这里 seed=7 时该噪声
+    # 恰好是 -1.0σ，几乎抵消了一整个 σ 的注入量，z 只剩 ~2.19，
+    # 让"注入 3σ 应检出约 3σ"这个断言变得看运气而非看实现对不对）。
+    noise[-1] = 0.0
+    y = 1.20 * mkt + 0.60 * sec + noise
     y[-1] += 3.0 * sigma                      # ← 3σ 的个股独立冲击
 
     r = AT.ols2(y, mkt, sec)
