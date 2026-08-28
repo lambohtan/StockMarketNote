@@ -19,8 +19,21 @@ import requests
 from . import outbox as OB
 from .market_time import et_today
 
-# 匹配 $ 后面跟数字（允许中间有空格、逗号、小数点）
-MONEY_RE = re.compile(r"\$\s*\d[\d,]*(\.\d+)?")
+# 金额守卫：ntfy 推送正文/标题绝不能出现金额。
+# 覆盖四种写法（Task 7 接入 LLM 摘要后，模型很可能把 $ 金额翻译成中文写法，
+# 光认 $ 前缀会被直接绕过）：
+#   1. $ 前缀：$1,234.56 / $ 1234
+#   2. 中文单位：1,234 美元 / 1234美元 / 50 万美元 / 3.2 亿美元 / 50万美金
+#   3. USD 前缀：USD 1,234
+#   4. USD 后缀：1234 USD
+# 刻意不匹配百分比（-8.7%）和 σ 值（2.4σ）—— 这些是推送正文的主要内容，
+# 误伤了系统就没法说人话了。
+MONEY_RE = re.compile(
+    r"\$\s*\d[\d,]*(?:\.\d+)?"
+    r"|\d[\d,]*(?:\.\d+)?\s*(?:万|亿)?\s*(?:美元|美金)"
+    r"|USD\s*\d[\d,]*(?:\.\d+)?"
+    r"|\d[\d,]*(?:\.\d+)?\s*USD"
+)
 
 TAGS = {
     "daily": "chart_with_upwards_trend",

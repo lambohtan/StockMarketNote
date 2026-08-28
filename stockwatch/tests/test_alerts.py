@@ -113,12 +113,191 @@ def test_level_from_8k_item():
     check("7.01 不是 L1", AL.level_for_item("7.01"), None)
 
 
+def test_attribution_quotes_allowed():
+    print("\n修复轮 1 · 转述第三方观点必须放行（判别标准：同一句话有没有归属标记）")
+    ALLOWED_QUOTES = [
+        "该分析师维持「建议持有」评级",
+        "高盛下调目标价至 $180",          # 同时含金额，用 render_alert（完整版可含金额）测
+        "厂商建议零售价上调 8%",
+        "该买家此前已持有该公司 5% 股份",
+        "审计整改函中建议加强内部控制",
+        "公司披露其外汇套期保值止损位",
+    ]
+    for s in ALLOWED_QUOTES:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ✅ 放行：{s}")
+        except ValueError as e:
+            print(f"  ❌ 误伤：{s!r} —— {e}")
+            FAIL.append(f"误伤(转述) {s}")
+
+    # 「高盛下调目标价至 $180」走完整版 render_alert（可含金额），
+    # 确认它作为 counterpoint 字段出现时整条提醒也能正常渲染，不被拦截。
+    alert = {
+        "ticker": "WXYZ", "level": "L2", "category": "价格异动",
+        "facts": "个股独立部分超出常规波动范围",
+        "data": "股价当日 -3.2%（个股独立部分 -2.8%，2.6σ）",
+        "base_rate": "该类申报的历史基准率本系统尚未收录",
+        "counterpoint": "高盛下调目标价至 $180",
+        "position": "占卫星仓 3.1%",
+        "next_steps": ["同行业其他公司同期的读数", "下一次财报日期"],
+    }
+    try:
+        AL.render_alert(alert, holding=None)
+        print("  ✅ 含「目标价」的转述作为 counterpoint 时整条提醒正常渲染")
+    except ValueError as e:
+        print(f"  ❌ 误伤：render_alert 整条崩了 —— {e}")
+        FAIL.append("误伤(转述) render_alert 含目标价转述")
+
+
+def test_money_formats_banned():
+    print("\n修复轮 1 · 金额守卫必须认得中文/USD 记法，不能只认 $ 前缀")
+    from sw.notify import assert_no_money
+    MONEY_SAMPLES = [
+        "$1,234.56",
+        "$ 1234",
+        "1,234 美元",
+        "1234美元",
+        "50 万美元",
+        "3.2 亿美元",
+        "50万美金",
+        "USD 1,234",
+        "1234 USD",
+    ]
+    for s in MONEY_SAMPLES:
+        try:
+            assert_no_money(s)
+            print(f"  ❌ 漏网：{s!r}")
+            FAIL.append(f"金额漏网 {s}")
+        except ValueError:
+            print(f"  ✅ 拦下：{s!r}")
+
+
+def test_percent_and_sigma_not_money():
+    print("\n修复轮 1 · 百分比和 σ 值不能被金额守卫误伤（这是推送正文的主要内容）")
+    from sw.notify import assert_no_money
+    SAFE_SAMPLES = [
+        "股价当日 -8.7%",
+        "个股独立部分 4.1σ",
+        "市盈率 24.5",
+        "占卫星仓 4.9%",
+        "波动率从 56.7% 变为 61.2%",
+    ]
+    for s in SAFE_SAMPLES:
+        try:
+            assert_no_money(s)
+            print(f"  ✅ 放行：{s}")
+        except ValueError as e:
+            print(f"  ❌ 误伤：{s!r} —— {e}")
+            FAIL.append(f"误伤(金额) {s}")
+
+
+def _make_portfolio():
+    """两只持仓：AAA 市值 1000，BBB 市值 3000，权重分别是 25% / 75%。"""
+    from sw.analysis.portfolio import Portfolio, Holding
+    h1 = Holding(ticker="AAA", market_value=1000.0, cost_basis=900.0)
+    h2 = Holding(ticker="BBB", market_value=3000.0, cost_basis=2500.0)
+    return Portfolio(snapshot_date="2026-08-27", holdings=[h1, h2], cash=0.0)
+
+
+def _attr(ticker, z, level, ret=-0.05, mkt=-0.01, sector=-0.01, idio=-0.03):
+    """构造一条 Task 4 形状的归因结果。"""
+    return {"ticker": ticker, "d": "2026-08-27", "ret": ret, "mkt_part": mkt,
+            "sector_part": sector, "idio": idio, "sigma": 0.02, "z": z,
+            "level": level, "beta_mkt": 1.0, "beta_sector": 1.0, "r2": 0.5,
+            "n": 60, "skipped_days": 0}
+
+
+def test_scan_l1_from_8k_item():
+    print("\n修复轮 1 · scan()：8-K 命中 L1 item 触发 L1，position 反映组合权重")
+    portfolio = _make_portfolio()
+    causes = {"AAA": [{"source": "8-K", "summary": "8-K：CFO 离职",
+                        "item": "5.02", "is_l1": True}]}
+    out = AL.scan(store=None, portfolio=portfolio, attributions=[], causes_by_ticker=causes)
+    levels = {a["ticker"]: a["level"] for a in out}
+    check("AAA 因 8-K L1 item 升级为 L1", levels.get("AAA"), "L1")
+    aaa = next((a for a in out if a["ticker"] == "AAA"), None)
+    check("position 反映权重 25.0%", aaa["position"] if aaa else None, "占组合 25.0%")
+
+
+def test_scan_l1_from_extreme_drop():
+    print("\n修复轮 1 · scan()：残差 ≤ -4σ 的单日下跌触发 L1")
+    portfolio = _make_portfolio()
+    attributions = [_attr("BBB", z=-4.5, level="extreme")]
+    causes = {"BBB": []}
+    out = AL.scan(store=None, portfolio=portfolio, attributions=attributions,
+                  causes_by_ticker=causes)
+    levels = {a["ticker"]: a["level"] for a in out}
+    check("BBB 因 z=-4.5 升级为 L1", levels.get("BBB"), "L1")
+
+
+def test_scan_large_gain_not_l1():
+    print("\n修复轮 1 · scan()：大涨（z ≥ +4）不升级为 L1（不对称设计，锁住方向）")
+    portfolio = _make_portfolio()
+    attributions = [_attr("BBB", z=4.5, level="extreme",
+                           ret=0.09, mkt=0.01, sector=0.02, idio=0.06)]
+    causes = {"BBB": []}
+    out = AL.scan(store=None, portfolio=portfolio, attributions=attributions,
+                  causes_by_ticker=causes)
+    levels = {a["ticker"]: a["level"] for a in out}
+    check("z=+4.5 不是 L1", levels.get("BBB") != "L1", True)
+
+
+def test_scan_anomaly_without_l1_cause_is_l2():
+    print("\n修复轮 1 · scan()：level=anomaly 且无 L1 原因 → L2")
+    portfolio = _make_portfolio()
+    attributions = [_attr("AAA", z=-2.5, level="anomaly")]
+    causes = {"AAA": [{"source": "新闻", "summary": "无关新闻",
+                        "item": None, "is_l1": False}]}
+    out = AL.scan(store=None, portfolio=portfolio, attributions=attributions,
+                  causes_by_ticker=causes)
+    levels = {a["ticker"]: a["level"] for a in out}
+    check("AAA 是 L2", levels.get("AAA"), "L2")
+
+
+def test_scan_normal_not_included():
+    print("\n修复轮 1 · scan()：level=normal 完全不出现在结果里")
+    portfolio = _make_portfolio()
+    attributions = [_attr("AAA", z=-0.5, level="normal")]
+    causes = {"AAA": []}
+    out = AL.scan(store=None, portfolio=portfolio, attributions=attributions,
+                  causes_by_ticker=causes)
+    tickers = {a["ticker"] for a in out}
+    check("AAA 不在结果里", "AAA" in tickers, False)
+
+
+def test_scan_z_none_no_crash():
+    print("\n修复轮 1 · scan()：归因数据缺失（z=None）不崩，也不误判级别")
+    portfolio = _make_portfolio()
+    # 8-K 触发 L1，但当天归因因样本不足返回 None —— 不能因为拼 data 字符串崩掉
+    attributions = [{"ticker": "AAA", "ret": None, "mkt_part": None, "sector_part": None,
+                      "idio": None, "z": None, "level": None, "skipped_days": 5}]
+    causes = {"AAA": [{"source": "8-K", "summary": "8-K：破产程序启动",
+                        "item": "1.03", "is_l1": True}]}
+    try:
+        out = AL.scan(store=None, portfolio=portfolio, attributions=attributions,
+                       causes_by_ticker=causes)
+        check("z=None 时不崩且仍因 8-K 触发 L1", out[0]["level"] if out else None, "L1")
+    except Exception as e:
+        print(f"  ❌ 崩了：{e!r}")
+        FAIL.append(f"scan() z=None 崩溃: {e!r}")
+
+
 if __name__ == "__main__":
     test_banned_directives()
     test_allowed_factual_statements()
     test_six_section_format()
     test_push_version_has_no_money()
     test_level_from_8k_item()
+    test_attribution_quotes_allowed()
+    test_money_formats_banned()
+    test_percent_and_sigma_not_money()
+    test_scan_l1_from_8k_item()
+    test_scan_l1_from_extreme_drop()
+    test_scan_large_gain_not_l1()
+    test_scan_anomaly_without_l1_cause_is_l2()
+    test_scan_normal_not_included()
+    test_scan_z_none_no_crash()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")

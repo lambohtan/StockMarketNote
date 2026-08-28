@@ -7,20 +7,47 @@ CLAUDE.md 的硬性约束：**不要求用户做任何事。系统给方向，�
 
 六段格式最后一段「接下来看什么」是整个设计的关键：
 它把用户从「要不要卖」这个二选一，转成「再收集三个信息」。
+
+## 指令性措辞守卫的设计（修复轮 1）
+
+禁的是「系统在指挥用户」，不是「文本里出现某些字」。早期版本按纯子串匹配，
+会把「转述第三方说了/做了什么」这类合法陈述也拦下 ——「该分析师维持『建议持有』
+评级」「高盛下调目标价」都是客观转述，恰恰是 counterpoint（反面观点）字段的
+典型内容；把这些也拦下，系统就会变成什么都不敢说，反而违背了产品目标。
+
+所以分两类处理：
+
+1. `BANNED_PHRASES`：明确指向用户的祈使句（"你应该""该减仓""止损设在"等），
+   任何情况下都不放行 —— 这类短语几乎不会出现在合法的转述语境里。
+2. `ATTRIBUTION_EXEMPT_PHRASES`：本身可能是转述也可能是指挥的短语
+   （"建议买入""建议卖出""建议持有""目标价"）—— 只有当**同一句话**里
+   没有归属标记（"分析师""据""报道""上调"等）时才判定为系统自己在下指令。
+   按句子（用 。！？\n 切分）逐句判断，不是整段判断，避免一句里有归属就把
+   整段一起豁免掉。
 """
 import re
 
 from .analysis.causes import L1_ITEMS
+from .notify import MONEY_RE as _MONEY
 
-# 指令性措辞。禁的是句式，不是词汇。
+# 明确指向用户的祈使句。任何情况下都不放行 —— 这类措辞几乎不会出现在
+# 合法的转述语境里，不需要归属豁免。
 BANNED_PHRASES = [
-    "建议买入", "建议卖出", "建议持有", "建议减", "建议加",
     "你应该", "你需要", "你必须", "请立即", "赶紧", "务必",
-    "该减仓", "该清仓", "该买", "该卖出",
-    "止损设在", "止损位", "目标价", "买入价", "卖出价", "建议价",
+    "该减仓", "该清仓", "该卖出", "止损设在", "买入价", "卖出价", "建议减",
 ]
 
-_MONEY = re.compile(r"\$\s*\d[\d,]*(\.\d+)?")
+# 这几条本身经常出现在"转述第三方在做什么/说什么"的合法陈述里
+# （分析师评级动作、审计整改函引述等），单独按子串匹配会把转述也拦下。
+ATTRIBUTION_EXEMPT_PHRASES = ["建议买入", "建议卖出", "建议持有", "目标价"]
+
+# 归属标记：同一句话里出现这些词，说明是在转述第三方，不是系统自己在下指令。
+ATTRIBUTION_MARKERS = [
+    "分析师", "评级", "机构", "券商", "报告称", "据", "报道",
+    "维持", "上调", "下调", "重申", "审计", "发行人", "公司称",
+]
+
+_SENTENCE_SPLIT = re.compile(r"[。！？\n]")
 
 
 def assert_no_directives(text):
@@ -31,6 +58,14 @@ def assert_no_directives(text):
             raise ValueError(
                 f"输出里出现指令性措辞 {p!r}。"
                 f"系统给方向，不下指令 —— 改写成客观陈述（描述世界，而不是指挥用户）")
+
+    for sentence in _SENTENCE_SPLIT.split(t):
+        for p in ATTRIBUTION_EXEMPT_PHRASES:
+            if p in sentence and not any(m in sentence for m in ATTRIBUTION_MARKERS):
+                raise ValueError(
+                    f"输出里出现指令性措辞 {p!r}（该句没有归属标记，视为系统自己在下"
+                    f"指令）。如果是转述第三方，请在同一句话里带上归属信息"
+                    f"（如「分析师」「据」「报道」等）")
 
 
 def level_for_item(item):
@@ -72,12 +107,17 @@ def scan(store, portfolio, attributions, causes_by_ticker):
 
         facts = "；".join(c["summary"] for c in (l1_causes or causes)[:3]) \
                 or "未找到明确原因"
+        # 归因字段可能因样本不足等原因是 None（skipped_days）——
+        # 8-K 触发的 L1 不依赖归因数据，不能因为拼这个字符串崩掉。
         data = ""
-        if attr:
+        if attr and all(attr.get(k) is not None
+                         for k in ("ret", "mkt_part", "sector_part", "idio", "z")):
             data = (f"当日 {attr['ret']*100:+.1f}%"
                     f"（大盘 {attr['mkt_part']*100:+.1f}%，"
                     f"行业 {attr['sector_part']*100:+.1f}%，"
                     f"个股独立 {attr['idio']*100:+.1f}%，{attr['z']:+.1f}σ）")
+        elif attr:
+            data = "当日归因数据不完整（样本不足或数据缺失），无法拆分大盘/行业/个股部分。"
 
         out.append({
             "ticker": tk,
