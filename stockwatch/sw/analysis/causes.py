@@ -36,6 +36,11 @@ ITEM_MEANING = dict(L1_ITEMS, **{
 
 FILING_WINDOW_DAYS = 4      # 异动日前后几天内的申报才算相关
 
+# 修复轮 2 · Important 3：样本太小时不下「行业性事件」的结论。
+# 1~2 只同行全动/全不动都不能说明什么，本项目宁可承认样本不足，
+# 也不编一个看似合理的判断。
+MIN_PEERS_FOR_SECTOR_CALL = 3
+
 
 def _window(d, back=FILING_WINDOW_DAYS):
     dd = date.fromisoformat(d)
@@ -48,10 +53,17 @@ def find_causes(store, ticker, d, peers=None, max_news=3):
     lo, hi = _window(d)
 
     # ---------- 1. 8-K ----------
-    rows = store.q(
-        "SELECT * FROM edgar_filings WHERE ticker=? AND form='8-K' "
-        "AND filed_at>=? AND filed_at<=? ORDER BY filed_at DESC",
-        (ticker, lo, hi))
+    # 修复轮 2 · Important 4：这里之前裸奔，没有 try/except。find_causes
+    # 会被套在遍历全部持仓的循环里调用（Task 9），单只查询异常（比如库
+    # 被锁、schema 意外变化）不能中断其余持仓的查找 —— 全局约束「数据源
+    # 失败不中断整个任务」同样适用于 store 查询本身。
+    try:
+        rows = store.q(
+            "SELECT * FROM edgar_filings WHERE ticker=? AND form='8-K' "
+            "AND filed_at>=? AND filed_at<=? ORDER BY filed_at DESC",
+            (ticker, lo, hi))
+    except Exception:
+        rows = []
     for r in rows:
         items = [i.strip() for i in (r["items"] or "").split(",") if i.strip()]
         is_l1 = any(i in L1_ITEMS for i in items)
@@ -95,7 +107,14 @@ def find_causes(store, ticker, d, peers=None, max_news=3):
     if peers:
         pr = peers
         if pr and pr.get("n_peers", 0) > 0:
-            if pr["looks_sector_wide"]:
+            if pr["n_peers"] < MIN_PEERS_FOR_SECTOR_CALL:
+                # 修复轮 2 · Important 3：样本太小，陈述事实，不下判断
+                out.append({
+                    "source": "同行读数",
+                    "summary": f"同行业仅有 {pr['n_peers']} 只可比标的，"
+                               f"样本不足以判断是否为行业性事件",
+                    "url": "", "item": None, "is_l1": False})
+            elif pr["looks_sector_wide"]:
                 out.append({
                     "source": "同行读数",
                     "summary": f"同行业另有 {pr['n_moving']}/{pr['n_peers']} 只同样出现异动"
@@ -114,6 +133,10 @@ def peer_readthrough(attributions, ticker, sector, z_thresh=2.0):
     """
     同行是不是也在动。
     attributions: [{"ticker","sector","z"}, ...]（整个组合的归因结果）
+
+    修复轮 2 · Important 3：只有同行数 >= MIN_PEERS_FOR_SECTOR_CALL 时才
+    允许 looks_sector_wide=True —— 1~2 只同行全动/全不动的样本太小，
+    不足以支撑「行业性事件」这个结论，宁可承认样本不足。
     """
     if not sector:
         return None
@@ -122,9 +145,14 @@ def peer_readthrough(attributions, ticker, sector, z_thresh=2.0):
     if not peers:
         return {"n_peers": 0, "n_moving": 0, "looks_sector_wide": False}
     moving = [a for a in peers if abs(a.get("z") or 0) >= z_thresh]
+    looks_sector_wide = (
+        len(peers) >= MIN_PEERS_FOR_SECTOR_CALL
+        and len(moving) * 2 >= len(peers)
+        and len(moving) > 0
+    )
     return {
         "n_peers": len(peers),
         "n_moving": len(moving),
-        # 过半同行同时异动 → 更像行业性事件
-        "looks_sector_wide": len(moving) * 2 >= len(peers) and len(moving) > 0,
+        # 过半同行同时异动 → 更像行业性事件（但样本太小不下结论，见上）
+        "looks_sector_wide": looks_sector_wide,
     }
