@@ -451,6 +451,29 @@ def test_comma_bypass_position_based_exemption():
             FAIL.append(f"误伤(逗号绕过) {s}")
 
 
+def test_position_field_is_validated_too():
+    print("\n修复轮 5 · position 字段也要单独校验（复审列出的五个字段之一，此前没有测试覆盖）")
+    # position 目前的实际取值都是 scan() 算出来的纯数字百分比，不会带指令性
+    # 措辞；但 render_alert() 的裁定明确把 position 列进了要逐字段校验的
+    # 字段里。这条测试补上此前没有覆盖到的检查点——不依赖 position 现在
+    # 恰好安全，而是确认"哪怕以后 position 的取值来源变了"，这道检查也在。
+    alert = {
+        "ticker": "WXYZ", "level": "L2", "category": "价格异动",
+        "facts": "个股独立部分超出常规波动范围",
+        "data": "股价当日 -3.2%（个股独立部分 -2.8%，2.6σ）",
+        "base_rate": "该类申报的历史基准率本系统尚未收录",
+        "counterpoint": "本次未检索到明确的反面材料",
+        "position": "该减仓了，占卫星仓 3.1%",   # ← 故意在 position 里塞裸指令
+        "next_steps": ["同行业其他公司同期的读数"],
+    }
+    try:
+        AL.render_alert(alert)
+        print("  ❌ 漏网：render_alert() 没有拦下 position 字段里的裸指令")
+        FAIL.append("漏网(position字段) render_alert")
+    except ValueError:
+        print("  ✅ 拦下：render_alert() 正确校验了 position 字段")
+
+
 def test_comprehensive_ab_matrix():
     """
     验收证据：把前四轮累积的全部正负样本合到一起，一次性双向压测。
@@ -676,6 +699,7 @@ if __name__ == "__main__":
     test_comma_bypass_position_based_exemption()
     test_cross_field_attribution_leak()
     test_single_field_attribution_still_allowed()
+    test_position_field_is_validated_too()
     test_comprehensive_ab_matrix()
     print("\n" + "=" * 50)
     if FAIL:
