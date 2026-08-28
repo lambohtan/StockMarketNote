@@ -1,0 +1,97 @@
+# StockWatch 配置
+
+identity:
+  # SEC 强制要求真实联系邮箱，用假地址可能被限流或封禁
+  sec_email: "lambohtan@gmail.com"
+
+data:
+  db_path: "data/stockwatch.db"
+  uploads_dir: "uploads"
+
+# 基准与因子代理，用于归因和风险分析
+benchmarks:
+  market: "SPY"
+  growth: "QQQ"
+  rates: "TLT"      # 利率敏感度代理
+  gold: "GLD"
+  sectors:
+    Technology: "XLK"
+    Healthcare: "XLV"
+    Financial Services: "XLF"
+    Consumer Cyclical: "XLY"
+    Consumer Defensive: "XLP"
+    Energy: "XLE"
+    Industrials: "XLI"
+    Utilities: "XLU"
+    Real Estate: "XLRE"
+    Basic Materials: "XLB"
+    Communication Services: "XLC"
+
+reddit:
+  filters: ["all-stocks", "wallstreetbets", "stocks"]
+  top_n: 100
+
+history:
+  price_period: "2y"   # 相关性/压力测试需要足够长的历史
+
+notify:
+  # ⚠️ ntfy.sh 的公共 topic 没有密码：任何知道这个名字的人都能读到你的推送，
+  # 也能往里发消息。所以名字必须随机、不可猜，且不要提交到公开仓库。
+  # 环境变量 STOCKWATCH_NTFY_TOPIC 优先于这里的值（要进 git 时用它）。
+  ntfy_topic: "stockwatch-xk41vohfuult2z0nk69t"
+  ntfy_server: "https://ntfy.sh"
+
+llm:
+  # 换模型改这一行。可选（含每百万 token 的输入/输出价格）：
+  #   claude-opus-5    $5 / $25    默认，最强
+  #   claude-sonnet-5  $2 / $10    够用且便宜一半以上
+  #   claude-haiku-4-5 $1 / $5     最省，适合纯摘要
+  # 注意：原来填的 claude-sonnet-4-5 是上一代型号，已换成当前型号。
+  model: "claude-opus-5"
+  max_tokens: 2000
+
+portfolio:
+  # 核心仓：独立定投，集中度分析里单列一份「剔除核心仓」的视角
+  core_tickers: ["VOO"]
+  # 完全不纳入分析的代码
+  exclude_tickers: []
+  # 穿透分析时展开成分股的 ETF（yfinance 只给前十大）
+  look_through_etfs: ["QQQ", "VOO", "SPY"]
+
+# 历史压力情景：把当前权重放回这些区间，看会经历什么
+# ⚠️ 假想推演，不是预测；缺数据的票用行业 ETF 代理并在报告中标出
+stress_scenarios:
+  - name: "2018Q4 加息恐慌"
+    start: "2018-09-20"
+    end: "2018-12-24"
+    note: "美联储加息 + 贸易战，SPY 最大回撤约 -19%"
+  - name: "2020 新冠崩盘"
+    start: "2020-02-19"
+    end: "2020-03-23"
+    note: "史上最快的熊市，33 天"
+  - name: "2022 通胀熊市"
+    start: "2022-01-03"
+    end: "2022-10-12"
+    note: "利率快速上行，成长股杀估值最惨"
+  - name: "2025-04 关税冲击"
+    start: "2025-02-19"
+    end: "2025-04-08"
+    note: "近期样本，科技股集中组合的敏感度参考"
+
+# 任务调度
+# ⚠️ 「算」和「发」是分开的两件事：
+#    compute 在开盘前算完存进 outbox，notify 到点了才把队列发出去。
+#    改推送时间只影响 notify，不影响计算；反之亦然。
+# ⚠️ launchd 按本机墙钟时间触发，换时区会自动跟随，不需要改这里。
+#    改完要跑 sw/schedule.py 重新生成并加载 plist 才生效。
+schedule:
+  compute_daily: "06:00"     # 开盘前 30 分钟（美股本机时区 06:30 开盘）—— 此时无当日半根 K 线
+  compute_retry: "07:00"     # 06:00 失败时的重试；当天已成功则空跑退出
+  compute_weekly: "06:30"    # 周报计算，与日报错开避免抢 SQLite 写锁
+  weekly_day: "tuesday"
+  push_time: "08:00"         # ★ 你唯一能感知的时间：outbox 在这一刻统一发出
+
+notify_policy:
+  l1_immediate: false        # L1 是否绕过 push_time 立即发。
+                             # 默认 false —— L1 依据是上一交易日收盘数据和 8-K，
+                             # 不是突发新闻，06:00 叫醒你没有意义

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+stockwatch/data/*.db
+stockwatch/data/*.db-wal
+stockwatch/data/*.db-shm
+stockwatch/uploads/*
+!stockwatch/uploads/.gitkeep
+.env
+*.csv
+
+# SDD 工作区（subagent 驱动开发的临时产物）
+.superpowers/
+# 生成的报告
+stockwatch/reports/*.md
