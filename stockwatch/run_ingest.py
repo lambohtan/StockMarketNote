@@ -60,6 +60,10 @@ def main():
         universe |= {r["ticker"] for r in prev if r["asset_type"] == "equity"}
         print(f"  未提供 CSV，沿用最近一次快照：{len(universe)} 只")
 
+    # 只含真实持仓的 ticker（不含基准/行业 ETF）——EDGAR 按 ticker 查申报时只查这些，
+    # 对 SPY/XLK 这类 ETF 查 8-K 没有意义
+    positions_tickers = set(universe)
+
     # 基准也要入库，归因和相关性要用
     bm = CFG.get("benchmarks", {}) or {}
     bench = {v for k, v in bm.items() if isinstance(v, str)}
@@ -104,12 +108,24 @@ def main():
         print("  跳过")
     else:
         eres = E.fetch_filings(CFG.get("identity.sec_email"), forms=("8-K","4"))
-        print(f"  {'✅' if eres.ok else '❌'} {eres.rows} 条 ({eres.latency_ms}ms) {eres.detail}")
+        print(f"  {'✅' if eres.ok else '❌'} 全市场 {eres.rows} 条 ({eres.latency_ms}ms) {eres.detail}")
         if eres.ok and not a.dry_run:
             st.upsert_many("edgar_filings",
                            ["accession","filed_at","ticker","cik","form","items",
                             "url","raw_json","seen_at"], eres.data)
         st.log_health(eres.source, eres.ok, eres.latency_ms, eres.detail)
+
+        # 修复轮 1：全市场索引不带 ticker/items（已实测确认），causes.py 找原因
+        # 要靠这两个字段匹配 —— 所以对持仓再按 ticker 逐个查一遍，补上这两个字段。
+        # 只对真实持仓查，不对基准/行业 ETF 查。
+        tres = E.fetch_filings_for_tickers(CFG.get("identity.sec_email"),
+                                           sorted(positions_tickers), forms=("8-K","4"))
+        print(f"  {'✅' if tres.ok else '❌'} 按持仓 {tres.rows} 条 ({tres.latency_ms}ms) {tres.detail}")
+        if tres.ok and not a.dry_run:
+            st.upsert_many("edgar_filings",
+                           ["accession","filed_at","ticker","cik","form","items",
+                            "url","raw_json","seen_at"], tres.data)
+        st.log_health(tres.source, tres.ok, tres.latency_ms, tres.detail)
 
     hr("数据库状态")
     for k, v in st.stats().items():
