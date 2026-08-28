@@ -20,6 +20,17 @@ from sw.sources import prices as P, reddit as R, edgar_src as E
 def hr(t):
     print(f"\n{'='*60}\n{t}\n{'='*60}")
 
+
+def _should_write_edgar(res, dry_run):
+    """
+    修复轮 2 · Critical 1：写库门槛只看「有没有抓到数据」（res.rows > 0），
+    不能看 res.ok —— fetch_filings_for_tickers 的 ok 反映的是「整个查询
+    过程有没有出错」（任何一只 ticker/表单失败都会让 ok=False），但那不该
+    连累其余几十只已经成功抓到的行一行都不写。抽成函数是为了这条判断本身
+    能被单测覆盖，而不是靠跑一次真正的 run_ingest.py 才能验证。
+    """
+    return res.rows > 0 and not dry_run
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--positions", help="Fidelity Positions CSV 路径")
@@ -109,10 +120,13 @@ def main():
     else:
         eres = E.fetch_filings(CFG.get("identity.sec_email"), forms=("8-K","4"))
         print(f"  {'✅' if eres.ok else '❌'} 全市场 {eres.rows} 条 ({eres.latency_ms}ms) {eres.detail}")
-        if eres.ok and not a.dry_run:
-            st.upsert_many("edgar_filings",
-                           ["accession","filed_at","ticker","cik","form","items",
-                            "url","raw_json","seen_at"], eres.data)
+        # 修复轮 2 · Critical 2：全市场扫描拿不到 ticker/items（只有 cik），
+        # 必须用 insert_ignore_many（INSERT OR IGNORE），不能覆盖按持仓查询
+        # 已经写好的完整行——否则同一条申报会被这条路径连续几天重新抹空。
+        if _should_write_edgar(eres, a.dry_run):
+            st.insert_ignore_many("edgar_filings",
+                                  ["accession","filed_at","ticker","cik","form","items",
+                                   "url","raw_json","seen_at"], eres.data)
         st.log_health(eres.source, eres.ok, eres.latency_ms, eres.detail)
 
         # 修复轮 1：全市场索引不带 ticker/items（已实测确认），causes.py 找原因
@@ -121,7 +135,11 @@ def main():
         tres = E.fetch_filings_for_tickers(CFG.get("identity.sec_email"),
                                            sorted(positions_tickers), forms=("8-K","4"))
         print(f"  {'✅' if tres.ok else '❌'} 按持仓 {tres.rows} 条 ({tres.latency_ms}ms) {tres.detail}")
-        if tres.ok and not a.dry_run:
+        # 修复轮 2 · Critical 1：写库门槛不能用 tres.ok —— ok 反映的是
+        # "查询过程是否顺利"（len(errs)==0），25+ 只持仓 × 2 种 form 里
+        # 任何一只限流/报错都会让 ok=False，但其余几十只已经抓到的行不该被
+        # 因此一行都不写。写库门槛只看有没有抓到数据，ok 只用来喂健康记录。
+        if _should_write_edgar(tres, a.dry_run):
             st.upsert_many("edgar_filings",
                            ["accession","filed_at","ticker","cik","form","items",
                             "url","raw_json","seen_at"], tres.data)
