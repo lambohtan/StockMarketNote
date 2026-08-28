@@ -150,10 +150,48 @@ def _start_positions(text, needle):
         start = i + 1
 
 
-def _has_marker_before(t, pos, markers):
-    """markers 里任意一个的起始位置是否早于 pos（不要求整个子串落在 pos 之前，
-    只比较起始位置——"下调目标"和"目标价"字符有重叠，比较起始位置才对）。"""
-    return any(mp < pos for m in markers for mp in _start_positions(t, m))
+# Task 7 验收条件（跨句攻击压测）：Task 6 上限轮裁定的已知残留是"单字段内
+# 先归属、远处夹带指令"的长句能绕过——例如 LLM 摘要典型形状「据悉，公司二季
+# 度营收增长强劲，好于市场预期，行业前景向好。建议买入 NVDA。」，"据悉"给
+# 后面整整一句无关的指令背书，之前只看"标记在前"的位置判据会放行。
+#
+# 用真实 LLM 输出形状红队 sw/llm.py 的 _guard() 之后（见 tests/test_llm.py
+# 的 test_cross_sentence_attack_on_guard），补两条邻近性判据，缺一不可：
+#
+#   ① 字符距离上限 _MAX_ATTRIBUTION_GAP —— 挡"没有句号、但拉得很长"的逗号
+#      串联长句。取值 20：对现有测试语料（本文件 + tests/test_alerts.py 的
+#      A_ALLOW 全集）逐条量出的最大合法间隔是 6 个字符（"审计整改函中建议
+#      加强内部控制"，"审计整改"→"建议加"），20 留了 3 倍多余量，同时仍
+#      远小于红队样本压出来的最小攻击间隔（"据悉行业景气度回升。建议加
+#      仓。"，10 个字符）。
+#   ② 标记与短语之间不能跨过完整句末标点（。！？）—— 单靠①堵不住"铺垫
+#      写得很短"的变体：「据悉大涨。建议买入。」标记到短语只隔 5 个字符，
+#      落在①的安全区间内，但明摆着是换了一句话、内容上毫不相关。这条不是
+#      走回"按分隔符切句子"的老路（那条路在修复轮 4 因为漏列逗号而被绕
+#      过）——这里只加一条独立的必要条件（"中间没有句末标点"），不影响
+#      逗号本身的处理，也不需要枚举所有分隔符。
+_MAX_ATTRIBUTION_GAP = 20
+_SENTENCE_END_PUNCTUATION = "。！？"
+
+
+def _has_marker_before(t, pos, markers, max_gap=_MAX_ATTRIBUTION_GAP):
+    """markers 里任意一个的起始位置是否早于 pos 且满足邻近性（不要求整个
+    子串落在 pos 之前，只比较起始位置——"下调目标"和"目标价"字符有重叠，
+    比较起始位置才对）。
+
+    邻近性 = 字符距离不超过 max_gap，且标记与短语之间不跨过完整句末标点，
+    两个条件都要满足才算"归属背书"生效（见上面 Task 7 验收条件的说明）。
+    """
+    for m in markers:
+        for mp in _start_positions(t, m):
+            if mp >= pos:
+                continue
+            if pos - mp > max_gap:
+                continue
+            if any(ch in _SENTENCE_END_PUNCTUATION for ch in t[mp:pos]):
+                continue
+            return True
+    return False
 
 
 def assert_no_directives(text):

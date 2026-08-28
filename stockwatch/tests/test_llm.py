@@ -101,6 +101,39 @@ def test_output_passes_directive_guard():
     print("  ✅ 客观陈述放行")
 
 
+def test_cross_sentence_attack_on_guard():
+    """
+    Task 7 验收条件：Task 6 上限轮裁定的已知残留 —— 单字段内「先归属、
+    远处夹带指令」的长句能绕过 assert_no_directives（归属标记远早于豁免
+    短语、且中间跨过一个完整句号）。
+
+    这里用「模拟 LLM 摘要输出的形状」（两句话以内：先转述一个归属来源，
+    再滑出到指令语气）红队 LM._guard()——它就是 summarize() 真正会走的
+    守卫路径。加固前跑这条测试会全部漏网（已用 git stash 验证过，见
+    task-7-report.md）；sw/alerts.py 加了邻近性上限（字符距离 + 句末标点）
+    之后，下面全部样本必须被拦下。
+    """
+    print("\n跨句攻击压测：模拟 LLM 摘要输出（两句话以内，先归属后指令）")
+    ATTACKS = [
+        # brief 里点名的规范案例：远距离归属为跨句指令背书
+        "据悉，公司二季度营收增长强劲，好于市场预期，行业前景向好。建议买入 NVDA。",
+        "分析师指出，公司基本面稳健，估值具备吸引力，长期逻辑清晰。建议加仓。",
+        "据报道，该公司近期治理表现良好，行业情绪偏暖。建议买入。",
+        "据悉，管理层近期表态积极，行业需求边际改善。建议卖出该持仓。",
+        "有报道称公司基本面良好。建议买入该标的。",
+        # 铺垫极短的变体：纯字符距离判据挡不住，必须靠句末标点判据补
+        "据悉大涨。建议买入。",
+        "据悉行业景气度回升。建议加仓。",
+    ]
+    for s in ATTACKS:
+        try:
+            LM._guard(s)
+            print(f"  ❌ 漏网：{s!r}")
+            FAIL.append(f"跨句攻击漏网 {s}")
+        except ValueError:
+            print(f"  ✅ 拦下：{s!r}")
+
+
 if __name__ == "__main__":
     test_api_key_conflict_is_fatal()
     test_api_mode_without_key_is_fatal()
@@ -108,6 +141,7 @@ if __name__ == "__main__":
     test_cli_cmd_shape()
     test_dry_run_returns_placeholder_and_calls_nothing()
     test_output_passes_directive_guard()
+    test_cross_sentence_attack_on_guard()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
