@@ -44,8 +44,13 @@ def test_idempotent_send():
     i1 = OB.enqueue(st, "daily", "T", "B")
     OB.mark_sent(st, i1)
     check("标记后队列为空", OB.unsent(st), [])
+    # 记下第一次 mark_sent 后的时间戳
+    first_sent_at = st.q("SELECT sent_at FROM outbox WHERE id=?", (i1,))[0]["sent_at"]
     OB.mark_sent(st, i1)          # 重复标记不能炸
     check("重复标记仍为空", OB.unsent(st), [])
+    # 检查时间戳未被改写（真正的幂等性）
+    second_sent_at = st.q("SELECT sent_at FROM outbox WHERE id=?", (i1,))[0]["sent_at"]
+    check("sent_at 时间戳幂等", first_sent_at, second_sent_at)
     st.close()
 
 
@@ -78,11 +83,49 @@ def test_has_kind_on():
     st.close()
 
 
+def test_claim_is_exclusive():
+    print("\n并发安全：claim 是原子的，第二次 claim 返回 False")
+    st = fresh_store()
+    i1 = OB.enqueue(st, "daily", "T", "B")
+    check("第一次 claim 成功", OB.claim(st, i1), True)
+    check("claim 后队列为空", OB.unsent(st), [])
+    check("第二次 claim 失败", OB.claim(st, i1), False)
+    st.close()
+
+
+def test_release_puts_it_back():
+    print("\n失败恢复：release 后条目重新进入队列")
+    st = fresh_store()
+    i1 = OB.enqueue(st, "daily", "T", "B")
+    OB.claim(st, i1)
+    check("claim 后队列为空", OB.unsent(st), [])
+    OB.release(st, i1)
+    rows = OB.unsent(st)
+    check("release 后条目回队", len(rows), 1)
+    check("可以再次 claim", OB.claim(st, i1), True)
+    st.close()
+
+
+def test_claim_does_not_touch_others():
+    print("\n claim 只影响目标条目，不影响其他条目")
+    st = fresh_store()
+    i1 = OB.enqueue(st, "daily", "T1", "B1")
+    i2 = OB.enqueue(st, "daily", "T2", "B2")
+    OB.claim(st, i1)
+    rows = OB.unsent(st)
+    check("claim i1 后队列剩 i2", len(rows), 1)
+    check("剩下的确是 i2", rows[0]["id"], i2)
+    st.close()
+
+
 if __name__ == "__main__":
     test_enqueue_and_unsent()
     test_idempotent_send()
     test_mark_failed_keeps_in_queue()
     test_has_kind_on()
+    test_claim_is_exclusive()
+    test_release_puts_it_back()
+    test_claim_does_not_touch_others()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
