@@ -347,6 +347,74 @@ def test_extra_marker_is_scoped_not_global():
         print(f"  ✅ 拦下：{s!r}（「交易」不是「建议买入」的有效归属标记）")
 
 
+def test_short_markers_do_not_leak_via_substring():
+    print("\n修复轮 3 · 短标记不能被无关词的子串命中而放行真指令（复审实测漏网）")
+    # 「据」「上调」「下调」「审计」「评级」「机构」「报道」这些单字/两字标记，
+    # 会被"根据""数据""占据""以上调整""以下调整""复审计划""批评级别"
+    # "有机构成""通报道歉"这类跟第三方转述毫无关系的词命中——一旦命中，
+    # 真指令就会蹭着这个"标记"逃逸。
+    MUST_BAN = [
+        "根据模型评分，建议买入该标的NVDA",
+        "根据历史数据，建议卖出该持仓",
+        "占据主导地位后，建议减仓以锁定收益",
+        "依据回测结果，建议加仓",
+    ]
+    for s in MUST_BAN:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ❌ 漏网：{s!r}")
+            FAIL.append(f"漏网(短标记子串) {s}")
+        except ValueError:
+            print(f"  ✅ 拦下：{s!r}")
+
+    # 放行方向：确认硬化后的完整搭配仍然认得真正的转述场景，
+    # 也确认"根据""数据"这两个词本身没有被错误地变成禁用词
+    # （最后两条故意含"根据""数据"但不含任何指令性短语）。
+    MUST_ALLOW = [
+        "据报道该公司考虑出售非核心资产",
+        "据悉该公司正在评估战略选择",
+        "该分析师维持「建议持有」评级",     # 回归：仍认得"分析师"+"维持"
+        "高盛下调目标价至 $180",           # 回归：仍认得"下调目标"
+        "审计函建议减少对单一供应商的依赖",  # 回归：仍认得"审计函"/"审计整改"
+        "根据审计报告，公司披露了三项整改事项",
+        "数据显示行业库存处于五年高位",
+    ]
+    for s in MUST_ALLOW:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ✅ 放行：{s}")
+        except ValueError as e:
+            print(f"  ❌ 误伤：{s!r} —— {e}")
+            FAIL.append(f"误伤(短标记硬化) {s}")
+
+
+def test_noun_suffix_exemption_for_gai_mai():
+    print("\n修复轮 3 · 该买/该卖出：名词性后缀豁免同时锁住两个方向")
+    MUST_ALLOW = [
+        "该卖出方为公司前董事",
+        "该买家此前已持有该公司 5% 股份",
+    ]
+    for s in MUST_ALLOW:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ✅ 放行：{s}")
+        except ValueError as e:
+            print(f"  ❌ 误伤：{s!r} —— {e}")
+            FAIL.append(f"误伤(名词后缀) {s}")
+
+    MUST_BAN = [
+        "该卖出这些质地一般的仓位了",
+        "该买这只票",
+    ]
+    for s in MUST_BAN:
+        try:
+            AL.assert_no_directives(s)
+            print(f"  ❌ 漏网：{s!r}")
+            FAIL.append(f"漏网(名词后缀) {s}")
+        except ValueError:
+            print(f"  ✅ 拦下：{s!r}")
+
+
 if __name__ == "__main__":
     test_banned_directives()
     test_allowed_factual_statements()
@@ -365,6 +433,8 @@ if __name__ == "__main__":
     test_attribution_exemption_is_per_sentence_not_whole_text()
     test_transactional_price_phrases()
     test_extra_marker_is_scoped_not_global()
+    test_short_markers_do_not_leak_via_substring()
+    test_noun_suffix_exemption_for_gai_mai()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
