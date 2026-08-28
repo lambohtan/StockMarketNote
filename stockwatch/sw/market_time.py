@@ -29,10 +29,20 @@ def is_trading_day(d):
 
 
 def session_closed(d, now=None):
-    """d 这个交易日是否已经收盘。过去的日子恒为 True。"""
+    """d 这个交易日是否已经收盘。过去的日子恒为 True。
+
+    `now` 必须是带时区的 aware datetime（本机 PT、UTC 均可，内部会
+    `astimezone(ET)` 转换）。刻意不接受 naive datetime ——
+    「naive 输入等于 ET」是一个会静默产生错误结果的假设：本模块要防的
+    正是这种「看起来合理但算错」的情况，所以传 naive datetime 直接报错，
+    强制调用方显式标注时区。
+    """
     now = now or now_et()
     if now.tzinfo is None:
-        now = now.replace(tzinfo=ET)
+        raise ValueError(
+            "session_closed 需要带时区的 datetime，收到了 naive datetime。"
+            "请显式传入 tzinfo（例如本机时区或 ET），不要依赖隐含假设。"
+        )
     now = now.astimezone(ET)
     if d < now.date():
         return True
