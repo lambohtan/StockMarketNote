@@ -27,7 +27,8 @@ def reddit_jumps(store, d, source="all-stocks"):
     """讨论热度跃升的票。返回 [{"ticker","rank","prev","delta"}]。"""
     rows = store.q(
         "SELECT ticker, rank, rank_24h_ago FROM reddit_rank "
-        "WHERE d=? AND source=? AND rank IS NOT NULL", (d, source))
+        "WHERE d=? AND source=? AND rank IS NOT NULL "
+        "AND COALESCE(TRIM(ticker), '') <> ''", (d, source))
     out = []
     for r in rows:
         rank, prev = r["rank"], r["rank_24h_ago"]
@@ -41,22 +42,33 @@ def reddit_jumps(store, d, source="all-stocks"):
     return sorted(out, key=lambda x: -x["delta"])
 
 
-def insider_buy_clusters(store, d, days=3, min_filers=2):
+def insider_filing_clusters(store, d, days=3, min_filings=2):
     """
-    最近几天里有多个 Form 4 申报的票。
+    最近几天里有多份 Form 4 申报的票。
 
-    ⚠️ 本期只按**申报笔数**判断，不解析买卖方向和金额 ——
-    edgar_filings 表存的是申报元数据，不含交易明细。
+    这是明确的 filing-count heuristic：当前 edgar_filings 只有申报元数据，
+    没有 owner/filer identity，也不解析买卖方向和金额。因此多份 accession
+    只能说明多份申报集中，不能推断是多个申报人或买入。
     解析明细属于 P4，届时要区分买入/卖出和 10b5-1 预设计划。
-    报告措辞因此只说「内部人申报集中」，不说「内部人买入」。
     """
     from datetime import date, timedelta
     lo = (date.fromisoformat(d) - timedelta(days=days)).isoformat()
     rows = store.q(
         "SELECT ticker, COUNT(DISTINCT accession) n FROM edgar_filings "
-        "WHERE form='4' AND ticker<>'' AND filed_at>=? AND filed_at<=? "
-        "GROUP BY ticker HAVING n>=? ORDER BY n DESC", (lo, d, min_filers))
+        "WHERE form='4' AND COALESCE(TRIM(ticker), '') <> '' "
+        "AND filed_at>=? AND filed_at<=? "
+        "GROUP BY ticker HAVING n>=? ORDER BY n DESC", (lo, d, min_filings))
     return [{"ticker": r["ticker"], "filings": r["n"]} for r in rows]
+
+
+def insider_buy_clusters(store, d, days=3, min_filers=2):
+    """兼容 brief 遗留的误命名接口。
+
+    `min_filers` 是历史参数名，当前语义直接映射到 canonical 函数的
+    `min_filings`。这里没有申报人 identity，不能把它解释成申报人数；生产
+    汇总固定调用 `insider_filing_clusters()`。
+    """
+    return insider_filing_clusters(store, d, days=days, min_filings=min_filers)
 
 
 def collect(store, d, held_tickers=None):
@@ -68,7 +80,7 @@ def collect(store, d, held_tickers=None):
         tag = "（已持仓）" if x["ticker"] in held else ""
         out.append(f"{x['ticker']}{tag} 社区讨论量从第 {x['prev']} 名升至第 {x['rank']} 名")
 
-    cl = insider_buy_clusters(store, d)[:3]
+    cl = insider_filing_clusters(store, d)[:3]
     for x in cl:
         tag = "（已持仓）" if x["ticker"] in held else ""
         out.append(f"{x['ticker']}{tag} 近 3 日有 {x['filings']} 份 Form 4 内部人申报")
