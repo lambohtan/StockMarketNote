@@ -5,6 +5,7 @@
   1. 残差正常的持仓**根本不出现** —— 日报一半的价值来自它不说什么
   2. 推送版不含金额 —— ntfy.sh 是公共服务器
 """
+import re
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -195,7 +196,13 @@ def test_push_money_survives_truncation_boundary():
     title, body = DR.render_push(ctx)
     check("裸的「50万」没有原样出现在推送正文里（应已被替换成占位符）",
           "50万" in body, False)
-    check("推送正文含金额占位符的痕迹", "[金额" in body, True)
+    # Task 9 收尾修复：占位符「[金额见面板]」共 6 字，紧跟在 77 个「情」
+    # 之后，会被 reason[:80] 切在第 80 字符——只留下没有配对「]」的
+    # 「[金额」。修复前的断言只查子串"[金额" in body，这个残缺片段本身
+    # 就会让它为真，测不出"有没有被正确清理"；这里改成断言"body 里不
+    # 存在任何没有闭合的裸方括号残尾"，真正验证截断收尾逻辑生效。
+    check("body 里没有残缺的方括号残尾（截断收尾逻辑已清理）",
+          bool(re.search(r"\[[^\]]*$", body, re.MULTILINE)), False)
     # 最终防线复核：即使占位符逻辑有问题，assert_no_money 也不能放过。
     assert_no_money(body)
 

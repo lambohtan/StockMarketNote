@@ -7,8 +7,19 @@
 ⭐ 最重要的设计：残差在正常范围的持仓**根本不出现在报告里**。
 日报一半的价值来自它不说什么 —— 每天列出 26 只票的涨跌等于没有信息。
 """
+import re
+
 from .alerts import assert_no_directives, render_alert
 from .notify import assert_no_money, MONEY_RE
+
+# 截断收尾用：字符串末尾如果留下一个没有配对「]」的裸「[」，说明是
+# reason[:80] 字符截断把占位符 [金额见面板] 切碎了（见 render_push 的
+# Task 9 收尾说明），删掉这个残缺片段，不让手机锁屏上出现无意义的尾巴。
+_DANGLING_BRACKET_RE = re.compile(r"\[[^\]]*$")
+
+
+def _drop_dangling_bracket(s):
+    return _DANGLING_BRACKET_RE.sub("", s)
 
 
 def _movers(ctx):
@@ -121,9 +132,16 @@ def render_push(ctx):
             # 校验」这个窗口。assert_no_money(body) 仍然保留作为最终防线，
             # 不能因为加了这行替换就把它去掉。
             reason = MONEY_RE.sub("[金额见面板]", reason)
+            # Task 9 收尾：占位符本身长度不受控（"[金额见面板]" 6 字），如果
+            # 恰好跨在第 80 字符截断边界上，会被切成 "[金额" 这种没有配对
+            # 右括号的残尾，锁屏上显示出来毫无意义。这不是安全问题——
+            # assert_no_money 不会因为多出一个 "[" 就误判，真实金额也不会
+            # 因为这一步而漏判——纯粹是显示质量问题，截断后统一把这类
+            # 残缺方括号片段去掉。
+            reason = _drop_dangling_bracket(reason[:80])
             L.append(f"{a['ticker']} {a['ret']*100:+.1f}%"
                      f"（个股独立 {a['idio']*100:+.1f}%，{a['z']:+.1f}σ）\n"
-                     f"  {reason[:80]}")
+                     f"  {reason}")
         if len(movers) > 5:
             L.append(f"…另有 {len(movers)-5} 项，详见面板")
     elif total == 0:
