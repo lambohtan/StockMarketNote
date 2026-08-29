@@ -69,7 +69,8 @@ FOLLOWED_BY_NOUN`）：「该买」「该卖出」后面紧跟 方/家/人/者/�
 import re
 
 from .analysis.causes import L1_ITEMS
-from .notify import MONEY_RE as _MONEY
+from .policy import MONEY_RE as _MONEY
+from .policy import assert_no_directives
 
 # 明确指向用户的祈使句。任何情况下都不放行 —— 这类措辞几乎不会出现在
 # 合法的转述语境里，不需要归属豁免。
@@ -215,7 +216,7 @@ def _has_marker_before(t, pos, markers):
     return False
 
 
-def assert_no_directives(text):
+def _legacy_assert_no_directives(text):
     """指令性措辞守卫。运行时和测试都用它 —— LLM 输出也要过这一关。"""
     t = text or ""
     for p in BANNED_PHRASES:
@@ -278,8 +279,13 @@ def scan(store, portfolio, attributions, causes_by_ticker):
             ws = portfolio.weights()
             w = ws.get(tk)
 
-        facts = "；".join(c["summary"] for c in (l1_causes or causes)[:3]) \
-                or "未找到明确原因"
+        facts = "；".join(c["summary"] for c in (l1_causes or causes)[:3])
+        if not facts:
+            unavailable = [h.get("source", "unknown")
+                           for h in (getattr(causes, "health", []) or [])
+                           if not h.get("ok", False)]
+            facts = ("未找到明确原因（部分信源不可用：" + ", ".join(unavailable)
+                     + "；不可用不等于没有原因）") if unavailable else "未找到明确原因"
         # 归因字段可能因样本不足等原因是 None（skipped_days）——
         # 8-K 触发的 L1 不依赖归因数据，不能因为拼这个字符串崩掉。
         data = ""

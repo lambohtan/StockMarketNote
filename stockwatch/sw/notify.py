@@ -12,66 +12,12 @@ ntfy 推送 + outbox drain。
 这种非原子流程，必须对每一条先 outbox.claim()，抢到令牌的一方才真的发送；
 没抢到的直接跳过，交由抢到的一方负责。详见 sw/outbox.py 顶部的说明。
 """
-import re
 from datetime import datetime
 import requests
 
 from . import outbox as OB
-from .market_time import et_today
-
-# 金额守卫：ntfy 推送正文/标题绝不能出现金额。
-# 覆盖四种写法（Task 7 接入 LLM 摘要后，模型很可能把 $ 金额翻译成中文写法，
-# 光认 $ 前缀会被直接绕过）：
-#   1. $ 前缀：$1,234.56 / $ 1234
-#   2. 中文单位：1,234 美元 / 1234美元 / 50 万美元 / 3.2 亿美元 / 50万美金
-#   3. USD 前缀：USD 1,234
-#   4. USD 后缀：1234 USD
-# 刻意不匹配百分比（-8.7%）和 σ 值（2.4σ）—— 这些是推送正文的主要内容，
-# 误伤了系统就没法说人话了。
-#
-# Task 8 修复轮 1：复审实测「50万元人民币」「50万港元」「1234usd」这三种写法
-# 未被上面四条覆盖 —— 原因分别是（a）币种单位表里只有 美元/美金，没有本币
-# 及其他外币单位；（b）USD 前后缀匹配是大小写敏感的，貼着数字写的小写
-# "usd" 会漏判。LLM 摘要来自新闻/8-K 原文，措辞空间比 brief 举的例子宽得多，
-# 补齐两类缺口：
-#   2'. 币种单位扩容：元 / 人民币 / 港元 / 港币 / 日元 / 欧元 / 英镑，
-#       同样支持 万 / 亿 / 千万 量词前缀（如 50万元、3.2亿港元、
-#       两千万人民币里的"千万"）。
-#       "元"单独放行有误伤风险（元旦/元素/单元都含"元"字），但要求紧跟在
-#       数字（可选量词）后面就把风险锁死到"digit + 元"这一种搭配，中文里
-#       这个搭配基本只用来记金额（"20元/股"也是金额，不是误伤）。
-#   3'/4'. USD/RMB/CNY/HKD 四个 ISO 代码前后缀均改成大小写不敏感
-#       （re.IGNORECASE），覆盖 usd/Usd/USD 以及贴着数字写、中间没有空格的
-#       "1234usd"。
-#
-# Task 9 修复轮 1 · Important 2：复审实测「13 万亿美元」「2.5 百万美元」
-# 「30 十亿美元」「5 千亿美元」「1.2 万亿元」全部漏判——量词表 _QTY 只有
-# 千万/万/亿三个词，不覆盖"十/百/千"与"万/亿"的组合。这不是小概率写法：
-# LLM 摘要经常把英文原文的 "$13 trillion"、"$2.5 million" 直接译成中文
-# 数量级词，覆盖面比 brief 举的例子宽得多。而且 sw/alerts.py 是
-# `from .notify import MONEY_RE as _MONEY` 复用同一份正则——这里补全，
-# L1 推送的金额清洗自动受益，不用改 alerts.py。
-# 补全为「十/百/千/万/亿」及其两两组合（十万/百万/千万/十亿/百亿/千亿/
-# 万亿）——覆盖常见的中文数量级写法。长的组合词排在前面，避免被短的
-# 单字（如"千"）先匹配、导致后面"亿美元"这类残余因为不含币种单位而整体
-# 匹配失败——不过 Python re 的 `(?:a|b)?` 本身会在整体匹配失败时回溯
-# 到下一个候选（乃至跳过量词组匹配空），排前只是让常见情况少走一次
-# 回溯，不是正确性的必要条件。
-# 必须确认不误伤的场景（都不含"数字紧邻币种"）：裸的百分比/σ/回归指标、
-# "60 日""2026 年""第 3 名"这类数字+量词但量词不是币种、"一万亿市值"
-# "元宇宙概念股""美元指数走强""单元测试覆盖率"这类含"万亿/元/美元"但前面
-# 不是 ASCII 数字的词——`\d` 只匹配阿拉伯数字，"一万亿"的"一"不触发。
-_CN_CURRENCY_UNITS = r"(?:人民币|港元|港币|日元|欧元|英镑|美元|美金|元)"
-_ISO_CODES = r"(?:USD|RMB|CNY|HKD)"
-_QTY = r"(?:十万|百万|千万|十亿|百亿|千亿|万亿|十|百|千|万|亿)?"
-
-MONEY_RE = re.compile(
-    r"\$\s*\d[\d,]*(?:\.\d+)?"
-    rf"|\d[\d,]*(?:\.\d+)?\s*{_QTY}\s*{_CN_CURRENCY_UNITS}"
-    rf"|{_ISO_CODES}\s*\d[\d,]*(?:\.\d+)?"
-    rf"|\d[\d,]*(?:\.\d+)?\s*{_ISO_CODES}",
-    re.IGNORECASE,
-)
+from .clock import logical_date as local_logical_date
+from .policy import MONEY_RE, assert_no_directives, assert_no_money
 
 TAGS = {
     "daily": "chart_with_upwards_trend",
@@ -81,22 +27,15 @@ TAGS = {
 }
 
 
-def assert_no_money(text):
-    """推送正文的金额守卫。命中就抛，绝不静默发出去。"""
-    m = MONEY_RE.search(text or "")
-    if m:
-        raise ValueError(
-            f"推送正文里出现金额 {m.group(0)!r} —— ntfy.sh 是公共服务器，"
-            f"账户金额不能出现在推送里（详情放本地面板）")
-
-
-def send(cfg, title, body, priority="default", tags=None, dry_run=False):
+def send(cfg, title, body, priority="default", tags=None, dry_run=False, kind=None):
     """发一条 ntfy。返回 (ok, detail)。"""
-    url = cfg.ntfy_url
-    if not url:
-        return False, "config.yaml 的 notify.ntfy_topic 是空的"
     assert_no_money(body)
     assert_no_money(title)
+    assert_no_directives(body)
+    assert_no_directives(title)
+    url = cfg.ntfy_url
+    if not url:
+        return False, "notify endpoint 未配置"
     if dry_run:
         # 干跑只展示内容，不把配置里的 topic（等同于密码）打印到日志。
         print(f"[dry-run] → ntfy endpoint\n  [{priority}] {title}\n  {body[:300]}")
@@ -117,7 +56,37 @@ def send(cfg, title, body, priority="default", tags=None, dry_run=False):
         return False, f"{type(e).__name__}: {e}"
 
 
-def drain(store, cfg, dry_run=False, today=None):
+def _failure_grace_active(store, logical_day, cfg, explicit_day, now=None,
+                          grace_seconds=None, allow_persist=True):
+    """判断 watchdog 是否仍在持久化 grace 窗口内。"""
+    info = store.run_info(logical_day) if hasattr(store, "run_info") else None
+    if info and info.get("status") == "completed":
+        # completed 是 emit 事务最后写入的标记；有它就不能产生 failure。
+        return False, True
+    supplied_grace = grace_seconds is not None
+    if grace_seconds is None:
+        # 老的直接调用传入 today 是兼容测试/脚本语义；正式 CLI 不传，走
+        # 配置的持久化 grace。生产 run_daily 会先写 runs running 记录。
+        grace_seconds = 0 if explicit_day else int(
+            cfg.get("schedule.failure_grace_seconds", 900) or 900)
+    if not info and grace_seconds > 0 and (not explicit_day or supplied_grace):
+        # notify 可能先于 compute 被 launchd 补跑；把这次预期持久化为
+        # running/grace，下一次唤醒再判断，避免一次偶发顺序颠倒就误报。
+        if allow_persist and hasattr(store, "begin_run"):
+            store.begin_run(logical_day, grace_seconds=grace_seconds, now=now)
+            return True, False
+        if not allow_persist:
+            return True, False
+    if info and info.get("grace_until"):
+        current = (now or datetime.now()).isoformat(
+            timespec="seconds")
+        if current < info["grace_until"]:
+            return True, False
+    return False, False
+
+
+def drain(store, cfg, dry_run=False, today=None, logical_date=None,
+          now=None, grace_seconds=None):
     """
     把队列里所有未发送的条目发出去。
 
@@ -136,35 +105,41 @@ def drain(store, cfg, dry_run=False, today=None):
     `UPDATE ... WHERE sent_at IS NULL` 的原子性保证只有一方能抢到令牌；
     抢不到的一方直接跳过，绝不重复发送。
     """
-    today = today or et_today().isoformat()
+    explicit_day = today is not None or logical_date is not None
+    today = logical_date or today or local_logical_date(now)
     failure_reported = False
     failure_preview = None
 
-    if (not OB.has_kind_on(store, "daily", today)
+    effective_grace = (0 if dry_run and grace_seconds is None else grace_seconds)
+    grace_active, completed = _failure_grace_active(
+        store, today, cfg, explicit_day, now=now, grace_seconds=effective_grace,
+        allow_persist=not dry_run)
+    if (not completed and not grace_active
+            and not OB.has_kind_on(store, "daily", today)
             and not OB.has_kind_on(store, "failure", today)):
         # 第二个条件是同一天不重复上报的关键：只看「今天有没有 daily」的话，
         # 只要今天一直没跑成，drain 每次被调用（补跑、定时）都会再入队一条
         # failure，把手机刷屏。「今天已经报过一次失败」本身也该算数。
-        last = store.q("SELECT substr(created_at,1,10) d FROM outbox "
-                       "WHERE kind='daily' ORDER BY created_at DESC LIMIT 1")
+        last = store.q("SELECT logical_date d FROM outbox "
+                       "WHERE kind='daily' ORDER BY logical_date DESC, id DESC LIMIT 1")
         last_ok = last[0]["d"] if last else "从未成功过"
         failure_preview = {
             "kind": "failure",
             "priority": "high",
             "title": f"StockWatch {today} 没跑成",
-            "body": f"今天的计算任务没有产出日报。\n"
-                    f"最后一次成功：{last_ok}\n"
-                    f"排查：查看 logs/ 目录，或在菜单栏里点「立即运行一次」。",
+            "body": f"今天的计算任务未产出日报。\n"
+                    f"最后一次成功：{last_ok}。",
         }
         if not dry_run:
-            # created_at 的日期部分锚定到 today（而不是 datetime.now()），
-            # 否则 has_kind_on(store, "failure", today) 在「今天」是调用方注入的
-            # 逻辑日期（测试、或补跑时的美股交易日）而非真实挂钟日期时会找不到
-            # 刚入队的这条，导致「同一天不重复上报」失效。
-            created_at = today + datetime.now().strftime("T%H:%M:%S")
+            # logical_date/event_key 是失败事件的持久化身份；created_at 只保留
+            # 发送审计时间，不承担跨时区/跨交易日幂等。
+            created_at = (now or datetime.now()).isoformat(timespec="seconds")
             OB.enqueue(store, "failure", failure_preview["title"],
                        failure_preview["body"], priority="high",
-                       created_at=created_at)
+                       created_at=created_at, logical_date=today,
+                       event_key="failure")
+            # 第一次 watchdog wake 仅建立 running/grace 标记，不立即宣称失败；
+            # 失败事件入队后仍可在下一次 wake 重复读取而保持幂等。
         failure_reported = True
 
     if dry_run:
@@ -177,7 +152,7 @@ def drain(store, cfg, dry_run=False, today=None):
                 ok, detail = send(cfg, row["title"], row["body"],
                                   priority=row["priority"] or "default",
                                   tags=TAGS.get(row["kind"]), dry_run=True)
-            except ValueError as e:
+            except Exception as e:
                 # 金额守卫命中：干跑也要报告失败，但不能把错误写回数据库。
                 ok, detail = False, str(e)
             if ok:
@@ -197,14 +172,22 @@ def drain(store, cfg, dry_run=False, today=None):
                               priority=row["priority"] or "default",
                               tags=TAGS.get(row["kind"]),
                               dry_run=dry_run)
-        except ValueError as e:
+        except Exception as e:
             # 金额守卫命中：计为失败留在队列里，绝不静默发出去
             ok, detail = False, str(e)
         if ok:
-            sent += 1  # claim 已经写了 sent_at，不需要再调 mark_sent
+            # 只有远端成功确认后才落 sent_at；claim 本身不改变发送状态。
+            if OB.mark_sent(store, row["id"], token=token):
+                sent += 1
+            else:
+                # lease 在极慢的发送期间可能已过期并被另一进程接管；
+                # owner-safe mark_sent 失败时不伪造本进程的成功计数。
+                continue
         else:
-            OB.release(store, row["id"], token)  # 归还领取，让下次 drain 重试
-            OB.mark_failed(store, row["id"], detail)
+            # 先由当前 lease owner 记失败，再释放 claim；错误 token 无法改动
+            # 他人的条目。
+            OB.mark_failed(store, row["id"], detail, token=token)
+            OB.release(store, row["id"], token)
             failed += 1
         store.log_health("ntfy", ok, 0, f"{row['kind']}: {detail}")
 

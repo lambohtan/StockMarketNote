@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
-"""
-每日计算主流程（launchd 06:00 调这个）。
-
-⚠️ 这个脚本**只入队，不发送**。推送由 run_notify.py 在 08:00 统一负责。
-拆开的理由见设计文档 §2.1：08:00 那个独立任务发现「今天没有 daily 条目」
-就能上报失败 —— 哪怕本脚本是被 OOM killer 干掉的，try/except 抓不到那种情况。
-
-用法：
-  python3 run_daily.py                    # 正常跑
-  python3 run_daily.py --dry-run          # 全流程但不写库不入队
-  python3 run_daily.py --skip-ingest      # 跳过抓数，用库里现有数据
-  python3 run_daily.py --force            # 当天已跑过也重新入队
-"""
+"""每日计算主流程：计算与发送分离，计算只写入 outbox。"""
 import argparse
 import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sw.config import CFG
@@ -24,174 +13,269 @@ from sw.store import Store
 from sw import outbox as OB, notify as NT, alerts as AL, llm as LM
 from sw import daily_report as DR
 from sw.analysis import portfolio as PF, attribution as AT, causes as CS, watchlist as WL
-from sw.market_time import et_today, now_et
+from sw.clock import logical_date as local_logical_date
+
+REPORTS_DIR = Path(__file__).resolve().parent / "reports"
+DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "stockwatch.db"
 
 
-def log(m):
-    print(f"[{datetime.now().isoformat(timespec='seconds')}] {m}", flush=True)
+def log(message):
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] {message}", flush=True)
 
 
 def _watchlist(store, d, held):
     try:
         return WL.collect(store, d, held)
-    except Exception as e:
-        log(f"  ⚠️ 观察池汇总失败：{type(e).__name__}: {e}")
+    except Exception as exc:
+        log(f"  ⚠️ 观察池汇总失败：{type(exc).__name__}: {exc}")
         return []
 
 
-def build_context(store, cfg, snapshot_date=None, window=60, use_llm=True):
-    """跑完全部确定性计算，返回渲染用的 ctx。这一层不写库、不入队，方便测试。"""
-    p = PF.build(store, cfg, snapshot_date)
+def _record_cause_health(store, causes):
+    """把原因适配器状态写入 source_health；只写类型/覆盖摘要，不写材料。"""
+    if getattr(store, "read_only", False):
+        return
+    for item in getattr(causes, "health", []) or []:
+        try:
+            detail = str(item.get("detail") or "")[:500]
+            store.log_health(item.get("source", "causes"), item.get("ok", False),
+                             0, detail)
+        except Exception:
+            # 健康记录是旁路观测，不能让它击穿日报主链路。
+            continue
+
+
+def build_context(store, cfg, snapshot_date=None, window=60, use_llm=True,
+                  logical_date=None, persist_health=True):
+    """跑确定性计算并返回渲染 ctx。
+
+    ``d``/``market_date`` 是最后完整交易日；``logical_date`` 是本机调度日，
+    两者即使跨周末或跨时区也不混用。直接库调用未显式传 logical_date 时，
+    为兼容旧 API 回退到 market_date；生产 main 总是显式传入本机墙钟日。
+    """
+    portfolio = PF.build(store, cfg, snapshot_date)
     sector_map = cfg.get("benchmarks.sectors") or {}
     market_etf = cfg.get("benchmarks.market", "SPY")
 
-    # 1. 归因
     attributions = []
-    for h in p.holdings:
-        etf = sector_map.get(h.sector) if h.sector else None
+    for holding in portfolio.holdings:
+        etf = sector_map.get(holding.sector) if holding.sector else None
         try:
-            r = AT.attribute(store, h.ticker, etf, market_etf, window)
-        except Exception as e:
-            log(f"  ⚠️ {h.ticker} 归因失败：{type(e).__name__}: {e}")
-            r = None
-        if r:
-            r["sector"] = h.sector
-            attributions.append(r)
+            result = AT.attribute(store, holding.ticker, etf, market_etf, window)
+        except Exception as exc:
+            log(f"  ⚠️ {holding.ticker} 归因失败：{type(exc).__name__}: {exc}")
+            result = None
+        if result:
+            result["sector"] = holding.sector
+            attributions.append(result)
 
-    d = attributions[0]["d"] if attributions else et_today().isoformat()
+    market_date = (attributions[0]["d"] if attributions
+                   else portfolio.snapshot_date or local_logical_date())
+    logical_day = logical_date or market_date
 
-    # 2. 只给异动的找原因 —— 正常的不查，省时间也省额度
+    # 异动票走完整原因链；正常票只读本地 8-K L1，避免无意义的新闻/LLM 调用。
     causes_by_ticker = {}
-    for a in attributions:
-        if a["level"] == "normal":
+    for attribution in attributions:
+        ticker = attribution["ticker"]
+        if attribution["level"] == "normal":
+            try:
+                l1 = CS.find_l1_causes(store, ticker, market_date)
+            except Exception as exc:
+                log(f"  ⚠️ {ticker} L1 查询失败：{type(exc).__name__}: {exc}")
+                l1 = []
+            if persist_health:
+                _record_cause_health(store, l1)
+            if l1:
+                causes_by_ticker[ticker] = l1
             continue
-        peers = CS.peer_readthrough(attributions, a["ticker"], a.get("sector"))
+        peers = CS.peer_readthrough(attributions, ticker, attribution.get("sector"))
         try:
-            causes_by_ticker[a["ticker"]] = CS.find_causes(
-                store, a["ticker"], a["d"], peers=peers)
-        except Exception as e:
-            log(f"  ⚠️ {a['ticker']} 找原因失败：{type(e).__name__}: {e}")
-            causes_by_ticker[a["ticker"]] = []
+            causes = CS.find_causes(store, ticker, market_date, peers=peers)
+        except Exception as exc:
+            log(f"  ⚠️ {ticker} 找原因失败：{type(exc).__name__}: {exc}")
+            causes = []
+        causes_by_ticker[ticker] = causes
+        if persist_health:
+            _record_cause_health(store, causes)
 
-    # 3. 恶化扫描
-    alerts = AL.scan(store, p, attributions, causes_by_ticker)
+    alerts = AL.scan(store, portfolio, attributions, causes_by_ticker)
 
-    # 4. LLM 摘要 —— 全流程唯一用 LLM 的地方
     if use_llm and causes_by_ticker:
-        for tk, cs in causes_by_ticker.items():
-            if not cs:
+        anomalous = {a["ticker"] for a in attributions
+                     if a.get("level") != "normal"}
+        for ticker, causes in causes_by_ticker.items():
+            # 正常票的 L1 只走本地文件，不因为正常而调用 LLM。
+            if ticker not in anomalous or not causes:
                 continue
-            material = "\n".join(f"[{c['source']}] {c['summary']}" for c in cs)
-            s = LM.summarize(cfg, material,
-                             f"下面是 {tk} 今日异动的相关材料，压成一句话说明发生了什么。",
-                             store=store)
-            if s:
-                cs.insert(0, {"source": "摘要", "summary": s, "url": "",
-                              "item": None, "is_l1": False})
+            material = "\n".join(f"[{c['source']}] {c['summary']}" for c in causes)
+            summary = LM.summarize(
+                cfg, material, f"下面是 {ticker} 今日异动的相关材料，压成一句话说明发生了什么。",
+                store=store)
+            if summary:
+                causes.insert(0, {"source": "摘要", "summary": summary, "url": "",
+                                  "item": None, "is_l1": False})
 
     return {
-        "d": d,
+        "d": market_date,                 # 旧渲染 API 的 market_date 别名
+        "market_date": market_date,
+        "logical_date": logical_day,
         "attributions": attributions,
         "causes_by_ticker": causes_by_ticker,
         "alerts": alerts,
-        "watchlist_events": _watchlist(store, d, {h.ticker for h in p.holdings}),
-        "market": {},                # 可选，缺失时报告自动省略该节
-        "portfolio_weights": p.weights(),
-        "n_holdings": len(p.holdings),
+        "watchlist_events": _watchlist(store, market_date,
+                                        {h.ticker for h in portfolio.holdings}),
+        "market": {},
+        "portfolio_weights": portfolio.weights(),
+        "n_holdings": len(portfolio.holdings),
     }
 
 
-def emit(store, cfg, ctx, dry_run=False, force=False):
-    """渲染 + 写库 + 入队。返回入队条目数。"""
-    if not force and OB.has_kind_on(store, "daily", ctx["d"]):
-        log(f"  {ctx['d']} 已经入过队，跳过（用 --force 强制重跑）")
+def _insert_outbox(c, created_at, logical_day, event_key, kind, priority, title, body):
+    cur = c.execute(
+        "INSERT OR IGNORE INTO outbox(created_at,logical_date,event_key,kind,priority,"
+        "title,body,attempts) VALUES (?,?,?,?,?,?,?,0)",
+        (created_at, logical_day, event_key, kind, priority, title, body))
+    return cur.rowcount == 1
+
+
+def emit(store, cfg, ctx, dry_run=False, force=False, report_dir=None):
+    """渲染并在一个 DB 事务中写报告、alerts、outbox，最后完成 run。"""
+    market_day = ctx.get("market_date") or ctx["d"]
+    logical_day = ctx.get("logical_date") or market_day
+    existing = store.run_info(logical_day)
+    if not force and existing and existing.get("status") == "completed":
+        log(f"  {logical_day} 已完成，跳过（用 --force 强制重跑）")
+        return 0
+    # 旧库迁移前没有 runs 时，保留历史 daily 的幂等语义。
+    if not force and not existing and OB.has_kind_on(store, "daily", logical_day):
+        log(f"  {logical_day} 已经入过队，跳过（用 --force 强制重跑）")
         return 0
 
-    md = DR.render_markdown(ctx)
+    markdown = DR.render_markdown(ctx)
     title, body = DR.render_push(ctx)
     if dry_run:
-        log("─" * 60); print(md); log("─" * 60)
-        log(f"[dry-run] 推送标题：{title}"); print(body)
+        log("─" * 60)
+        print(markdown)
+        log("─" * 60)
+        log(f"[dry-run] 推送标题：{title}")
+        print(body)
         return 0
 
     now = datetime.now().isoformat(timespec="seconds")
-    store.upsert_many("reports", ["d", "kind", "body_md", "created_at"],
-                      [(ctx["d"], "daily", md, now)])
-    out = Path(__file__).resolve().parent / "reports" / f"daily_{ctx['d']}.md"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(md, encoding="utf-8")
+    daily_key = "daily" if not force else f"daily:force:{uuid4().hex}"
+    inserted = 0
+    with store.tx() as c:
+        # 计算开始/恢复标记。completed 只有本事务最后才会写。
+        c.execute(
+            "INSERT INTO runs(logical_date,market_date,status,started_at,grace_until,attempt_count) "
+            "VALUES (?,?, 'running', ?, ?, 1) ON CONFLICT(logical_date) DO UPDATE SET "
+            "market_date=excluded.market_date,status='running',started_at=excluded.started_at,"
+            "grace_until=excluded.grace_until,attempt_count=runs.attempt_count+1",
+            (logical_day, market_day, now, now))
+        c.execute(
+            "INSERT INTO reports(d,kind,body_md,created_at,logical_date) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(d,kind) DO UPDATE SET body_md=excluded.body_md,"
+            "created_at=excluded.created_at,logical_date=excluded.logical_date",
+            (market_day, "daily", markdown, now, logical_day))
+        inserted += int(_insert_outbox(c, now, logical_day, daily_key, "daily",
+                                        "default", title, body))
+        for alert in ctx.get("alerts", []):
+            if alert["level"] != "L1":
+                continue
+            alert_title, alert_body = AL.render_alert_push(alert)
+            key = f"l1:{alert['ticker']}:{alert['category']}"
+            inserted += int(_insert_outbox(c, now, logical_day, key, "l1",
+                                            "urgent", alert_title, alert_body))
+            c.execute(
+                "INSERT OR IGNORE INTO alerts(d,ticker,level,category,body_md,pushed,"
+                "logical_date,event_key) VALUES (?,?,?,?,?,?,?,?)",
+                (market_day, alert["ticker"], alert["level"], alert["category"],
+                 AL.render_alert(alert), 0, logical_day, key))
+        # completed 是事务的最后一个业务写入；任意前面异常都会整体 rollback。
+        c.execute(
+            "UPDATE runs SET status='completed',market_date=?,completed_at=?,last_error=NULL "
+            "WHERE logical_date=?", (market_day, now, logical_day))
 
-    n = 0
-    # created_at 锚定到 ctx['d']（本次计算所依据的交易日），而不是入队那一刻
-    # 的挂钟时间 —— has_kind_on() 的「当天是否入过队」判断按 created_at 的
-    # 日期部分匹配，07:00 重试任务和 06:00 首跑算的是同一个交易日，两次
-    # created_at 必须落在同一天才能被判定为「已经入过队」，见
-    # tests/test_outbox.py::test_has_kind_on 里同样的用法。
-    OB.enqueue(store, "daily", title, body, priority="default",
-              created_at=ctx["d"])
-    n += 1
-    for al in ctx["alerts"]:
-        if al["level"] != "L1":
-            continue
-        t, b = AL.render_alert_push(al)
-        OB.enqueue(store, "l1", t, b, priority="urgent")
-        n += 1
-
-    # alerts 表也留一份，供面板和以后的 P7 回看
-    store.upsert_many("alerts", ["d", "ticker", "level", "category", "body_md"],
-                      [(ctx["d"], a["ticker"], a["level"], a["category"],
-                        AL.render_alert(a)) for a in ctx["alerts"]])
-    log(f"  ✅ 入队 {n} 条，报告写入 {out.name}")
-    return n
+    if report_dir is None:
+        # 测试/临时 DB 的报告也必须落在临时目录，避免验收过程覆盖用户报告；
+        # 只有正式配置 DB 才使用项目的 reports/ 目录。
+        # 不读取可变的 STOCKWATCH_DB 环境变量判断正式目录：测试 CLI 会临时
+        # 改它，而那时仍必须把报告留在临时 DB 旁边。
+        configured_db = DEFAULT_DB_PATH.resolve()
+        store_db = Path(store.path).resolve()
+        report_root = REPORTS_DIR if store_db == configured_db else store_db.parent / "reports"
+    else:
+        report_root = Path(report_dir)
+    report_path = report_root / f"daily_{market_day}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(markdown, encoding="utf-8")
+    log(f"  ✅ 入队 {inserted} 条，报告写入 {report_path.name}")
+    return inserted
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--skip-ingest", action="store_true")
-    ap.add_argument("--force", action="store_true")
-    ap.add_argument("--window", type=int, default=60)
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--skip-ingest", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--window", type=int, default=60)
+    args = parser.parse_args()
 
-    st = Store(CFG.db_path)
+    logical_day = local_logical_date()
+    st = Store.open_read_only(CFG.db_path) if args.dry_run else Store(CFG.db_path)
     try:
-        LM.check_env(CFG)          # 配置错了立刻退出，不要跑完才发现
-    except LM.LLMConfigError as e:
-        log(f"❌ LLM 配置有问题：{e}")
-        st.close()
-        return 1
+        if not args.dry_run:
+            LM.check_env(CFG)
+            if not args.force and (st.run_info(logical_day) or {}).get("status") == "completed":
+                log(f"{logical_day} 已完成，重试任务退出")
+                return 0
+            st.begin_run(logical_day, grace_seconds=int(
+                CFG.get("schedule.failure_grace_seconds", 900) or 900), force=args.force)
 
-    try:
-        if not a.skip_ingest:
+        if args.dry_run:
+            log("[dry-run] 跳过 ingest（严格只读预览）")
+        elif not args.skip_ingest:
             log("1/3 抓数")
             import run_ingest
-            sys.argv = ["run_ingest.py"] + (["--dry-run"] if a.dry_run else [])
+            sys.argv = ["run_ingest.py"]
             run_ingest.main()
 
         log("2/3 计算")
-        ctx = build_context(st, CFG, window=a.window)
+        ctx = build_context(st, CFG, window=args.window, use_llm=not args.dry_run,
+                            logical_date=logical_day, persist_health=not args.dry_run)
         log(f"  {len(ctx['attributions'])} 只归因成功，"
             f"{sum(1 for x in ctx['attributions'] if x['level'] != 'normal')} 只异动，"
             f"{len(ctx['alerts'])} 条提醒")
 
         log("3/3 渲染与入队")
-        emit(st, CFG, ctx, dry_run=a.dry_run, force=a.force)
+        emit(st, CFG, ctx, dry_run=args.dry_run, force=args.force)
 
-        # 睡过头的堵法：已经过了推送点就自己 drain 一次。
-        # 注意调的是 notify.drain 这**同一个函数**，不是复制一份逻辑。
         push_at = str(CFG.get("schedule.push_time", "08:00"))
-        if not a.dry_run and datetime.now().strftime("%H:%M") >= push_at:
+        if (not args.dry_run
+                and datetime.now().strftime("%H:%M") >= push_at):
             log(f"  当前已过推送点 {push_at}，立即 drain 一次")
-            r = NT.drain(st, CFG)
-            log(f"  drain: 发出 {r['sent']} 条，失败 {r['failed']} 条")
-
-        st.close()
+            result = NT.drain(st, CFG, logical_date=logical_day)
+            log(f"  drain: 发出 {result['sent']} 条，失败 {result['failed']} 条")
         return 0
+    except LM.LLMConfigError as exc:
+        log(f"❌ LLM 配置有问题：{exc}")
+        if not args.dry_run:
+            try:
+                st.mark_run_failed(logical_day, type(exc).__name__)
+            except Exception:
+                pass
+        return 1
     except Exception:
         log("❌ 主流程异常：\n" + traceback.format_exc())
-        st.log_health("run_daily", False, 0, traceback.format_exc()[-400:])
-        st.close()
+        if not args.dry_run:
+            try:
+                st.log_health("run_daily", False, 0, "pipeline_exception")
+                st.mark_run_failed(logical_day, "pipeline_exception")
+            except Exception:
+                pass
         return 1
+    finally:
+        st.close()
 
 
 if __name__ == "__main__":

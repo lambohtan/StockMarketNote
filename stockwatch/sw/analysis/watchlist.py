@@ -7,9 +7,8 @@
 有价值的只有变化率：从 50 名开外冲进前 20。单独用价值接近零，
 必须与基本面交叉验证，所以这里只把它当「值得看一眼」的线索，不打分。
 
-**Form 4**：滞后仅 1–2 个交易日，是最快的信号。但研究显示申报后 5 日
-超额收益 +1.0%，**63 个交易日后中位数转为 −3.6%** ——
-它是发现线索的触发器，不是长期持有的理由。这句话要出现在报告里。
+**Form 4**：滞后仅 1–2 个交易日，是最快的信号。本期只统计近期申报数量，
+不解析申报人的身份、交易方向或收益含义；它只是待核查线索。
 
 **13F**：滞后 45 天，只认「≥2 家基金同季新建仓」的 cluster。
 本期只把 13F-HR 加进抓取范围让数据攒起来，cluster 检测属于 P4。
@@ -19,8 +18,9 @@ EXCLUDE_TOP_N = 10      # 绝对排名进前 10 的直接排除
 JUMP_INTO = 20          # 冲进前 20 才算跃升
 JUMP_FROM = 50          # 且此前在 50 名开外
 
-FORM4_NOTE = ("内部人申报后 5 日超额收益中位数约 +1.0%，"
-              "但 63 个交易日后转为约 −3.6% —— 这是线索触发器，不是持有理由")
+# 当前 schema 只有 accession/issuer 元数据，没有交易方向或 reporting owner；
+# 因此不在中性 filing-count 事件中附加收益方向先验，待 P4 明细解析。
+FORM4_NOTE = "这是申报数量线索，不含交易方向或收益预测"
 
 
 def reddit_jumps(store, d, source="all-stocks"):
@@ -52,12 +52,14 @@ def insider_filing_clusters(store, d, days=3, min_filings=2):
     解析明细属于 P4，届时要区分买入/卖出和 10b5-1 预设计划。
     """
     from datetime import date, timedelta
-    lo = (date.fromisoformat(d) - timedelta(days=days)).isoformat()
+    # days=3 表示含 d 在内的三个日历日：[d-2, d]，与用户「近3日」一致。
+    span = max(1, int(days)) - 1
+    lo = (date.fromisoformat(d) - timedelta(days=span)).isoformat()
     rows = store.q(
         "SELECT ticker, COUNT(DISTINCT accession) n FROM edgar_filings "
         "WHERE form='4' AND COALESCE(TRIM(ticker), '') <> '' "
         "AND filed_at>=? AND filed_at<=? "
-        "GROUP BY ticker HAVING n>=? ORDER BY n DESC", (lo, d, min_filings))
+        "GROUP BY ticker HAVING n>=? ORDER BY n DESC, ticker", (lo, d, min_filings))
     return [{"ticker": r["ticker"], "filings": r["n"]} for r in rows]
 
 

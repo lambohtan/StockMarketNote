@@ -1,12 +1,16 @@
-"""SEC EDGAR —— 8-K / Form 4 / 13F。官方源，最可靠。"""
+"""SEC EDGAR 适配器：8-K / Form 4 / 13F-HR。"""
 import json
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta
+
 from .base import SourceResult, timed
 
-# 触发 L1 提醒的 8-K item：会计问题、审计师变更、破产、减值、高管变动、网络安全事件
-L1_ITEMS = {"4.02", "4.01", "1.03", "2.06", "5.02", "1.05"}
-
 _ready = False
+
+# 可由应用随数据更新、由测试替换的确定性 CIK→ticker 层。没有映射时仍持久化
+# CIK；有映射时全市场 Form 4 可以进入观察池，无需逐公司再发网络请求。
+CIK_TICKER_MAP = {}
+
+
 def _init(email):
     global _ready
     if not _ready:
@@ -15,123 +19,148 @@ def _init(email):
         _ready = True
 
 
-def _assemble_row(f, form, now, ticker=""):
-    """
-    把一个 filing 对象组装成入库行。纯函数，不发网络请求，便于测试。
+def _norm_cik(cik):
+    raw = str(cik or "").strip()
+    return raw.zfill(10) if raw.isdigit() else raw
 
-    行结构固定为 (accession, filed_at, ticker, cik, form, items, url, raw_json, seen_at)，
-    这样全市场扫描（fetch_filings）和按 ticker 查（fetch_filings_for_tickers）
-    可以共用同一个 upsert_many 调用。
 
-    f 只需鸭子类型具备 accession_no/accession_number、filing_date、items、cik、
-    filing_url、company 这些属性即可（edgar 库两种查询路径返回的对象都满足）。
+def resolve_ticker(cik, mapping=None):
+    """确定性 CIK 映射；mapping 可注入假实现，不发网络。"""
+    source = CIK_TICKER_MAP if mapping is None else mapping
+    return str(source.get(_norm_cik(cik), source.get(str(cik or ""), "")) or "").upper().strip()
 
-    ticker 参数：按 ticker 查询时我们本来就知道 ticker（就是拿它去查的），直接传入；
-    全市场扫描时不知道，退回 filing 对象自带的 ticker 属性（通常也是空——
-    这正是修复轮 1 发现的问题：全市场索引结构上就不带 ticker）。
-    """
-    acc = getattr(f, "accession_no", None) or getattr(f, "accession_number", "")
+
+def _assemble_row(f, form, now, ticker="", ticker_map=None):
+    """纯函数：把 filing 对象规整成 edgar_filings 行。"""
+    accession = getattr(f, "accession_no", None) or getattr(f, "accession_number", "")
     items = getattr(f, "items", None)
     if isinstance(items, (list, tuple)):
-        items_s = ",".join(str(i) for i in items)
-    else:
-        items_s = items or ""
+        items = ",".join(str(item) for item in items)
+    items = items or ""
+    cik = str(getattr(f, "cik", ""))
+    mapped = resolve_ticker(cik, ticker_map)
+    filing_ticker = getattr(f, "ticker", None) or ""
     return (
-        str(acc),
-        str(getattr(f, "filing_date", "")),
-        ticker or (getattr(f, "ticker", None) or ""),
-        str(getattr(f, "cik", "")),
-        form, items_s,
+        str(accession), str(getattr(f, "filing_date", "")),
+        str(ticker or filing_ticker or mapped), cik, form, str(items),
         str(getattr(f, "filing_url", "") or ""),
-        json.dumps({"company": str(getattr(f, "company", ""))}, ensure_ascii=False),
-        now,
+        json.dumps({"company": str(getattr(f, "company", ""))}, ensure_ascii=False), now,
     )
 
 
-@timed("edgar.filings")
-def fetch_filings(email, forms=("8-K", "4"), days_back=3, limit=400):
-    """拉最近几天的申报。不按 ticker 逐个查（那样几千只全市场逐个查会被限流），
-    而是拉全市场最近的，入库后再和你的持仓/股票池做 join。
+def _window(as_of=None, days_back=3):
+    end = date.fromisoformat(as_of) if as_of else date.today()
+    span = max(1, int(days_back)) - 1
+    return (end - timedelta(days=span)).isoformat(), end.isoformat()
 
-    注意（修复轮 1 实测确认）：这条路径返回的索引行结构上不带 ticker 和 items，
-    只有 cik —— 所以 causes.py 真正依赖的匹配字段要靠 fetch_filings_for_tickers
-    补上。这个函数仍然保留，P4 观察池（盯着非持仓的股票池）要用全市场扫描。"""
+
+def _iter_collection_with_status(collection, fallback_limit=400):
+    """兼容 edgartools collection、分页迭代器和普通 list。"""
+    if collection is None:
+        return []
+    pages = getattr(collection, "iter_pages", None)
+    if callable(pages):
+        out = []
+        for page in pages():
+            out.extend(list(page or []))
+        return out, True
+    try:
+        return list(collection), True
+    except TypeError:
+        head = getattr(collection, "head", None)
+        if callable(head):
+            # 只有底层对象没有可迭代/分页接口时才被迫使用 cap，并显式
+            # 返回 complete=False，让 source_health 暴露数据可能被截断。
+            return list(head(fallback_limit or 400)), False
+        raise
+
+
+def _iter_collection(collection):
+    """兼容旧内部调用，返回完整性由 _iter_collection_with_status 提供。"""
+    return _iter_collection_with_status(collection)[0]
+
+
+def _detail(form, fetched, kept, errors):
+    bits = [f"{form}:扫描 {fetched} 条，窗口内 {kept} 条"]
+    if errors:
+        bits.append("失败=" + ",".join(errors[:3]))
+    return "；".join(bits)
+
+
+@timed("edgar.filings")
+def fetch_filings(email, forms=("8-K", "4"), days_back=3, limit=400,
+                  as_of=None, ticker_map=None):
+    """全市场扫描指定日期窗口，完成可用分页后再组装数据。
+
+    ``limit`` 是旧 API 参数，当前实现不会用它在首个 head() 上静默截断；
+    collection 能提供完整迭代时全部保留。若底层迭代本身报错，ok=False，
+    detail 会带扫描/窗口计数，不能把部分覆盖声称为完整成功。
+    """
     _init(email)
     from edgar import get_filings
     now = datetime.now().isoformat(timespec="seconds")
-    rows, errs = [], []
+    lo, hi = _window(as_of, days_back)
+    rows, errors = [], []
     for form in forms:
         try:
-            fl = get_filings(form=form).head(limit)
-            for f in fl:
-                try:
-                    rows.append(_assemble_row(f, form, now))
-                except Exception:
+            filings, complete = _iter_collection_with_status(get_filings(form=form), limit)
+            kept = 0
+            for filing in filings:
+                filed = str(getattr(filing, "filing_date", ""))[:10]
+                if filed and not (lo <= filed <= hi):
                     continue
-        except Exception as e:
-            errs.append(f"{form}:{type(e).__name__}: {e}")
+                kept += 1
+                try:
+                    rows.append(_assemble_row(filing, form, now, ticker_map=ticker_map))
+                except Exception:
+                    errors.append(f"{form}:row")
+            if not complete:
+                errors.append(f"{form}:使用 cap {limit}，扫描 {len(filings)} 条、窗口内 {kept} 条，扫描不完整")
+        except Exception as exc:
+            errors.append(f"{form}:{type(exc).__name__}")
     return SourceResult(source="edgar.filings", rows=len(rows), data=rows,
-                        ok=len(rows) > 0, detail="; ".join(errs[:3]))
+                        ok=not errors,
+                        detail=("窗口 " + lo + "~" + hi + "；" + "; ".join(errors[:3]))
+                        if errors else f"窗口 {lo}~{hi}，完整扫描 {len(rows)} 条")
 
 
 @timed("edgar.filings_by_ticker")
-def fetch_filings_for_tickers(email, tickers, forms=("8-K", "4"), days_back=7, limit_per=10):
-    """
-    按持仓 ticker 逐个查申报。
-
-    为什么需要这个：全市场的 get_filings() 索引行**不带 ticker 和 items**（只有 cik），
-    而 causes.py 要靠 ticker 匹配、靠 items 判定 L1。Company(ticker).get_filings()
-    能拿到 items，ticker 则是我们查询时就已知的。
-
-    P1 的注释担心「按 ticker 逐个查会被限流」——那是针对全市场几千只的顾虑。
-    持仓只有二三十只，SEC 限速 10 req/s，完全够用。
-
-    单只 ticker 或单个 form 查询失败不能中断其余的（全局约束：数据源失败不中断
-    整个任务），失败记入 errs、继续下一个。
-    """
+def fetch_filings_for_tickers(email, tickers, forms=("8-K", "4"), days_back=7,
+                              limit_per=10, as_of=None, ticker_map=None):
+    """按持仓查询并先过滤日期窗口，再应用每票上限。"""
     _init(email)
     from edgar import Company
     now = datetime.now().isoformat(timespec="seconds")
-    cutoff = (date.today() - timedelta(days=days_back)).isoformat()
+    lo, hi = _window(as_of, days_back)
     rows, errs = [], []
-    for tk in tickers:
-        tk = str(tk).upper().strip()
-        if not tk:
+    for ticker in tickers:
+        ticker = str(ticker).upper().strip()
+        if not ticker:
             continue
         try:
-            c = Company(tk)
-        except Exception as e:
-            errs.append(f"{tk}:{type(e).__name__}: {e}")
+            company = Company(ticker)
+        except Exception as exc:
+            errs.append(f"{ticker}:{type(exc).__name__}")
             continue
         for form in forms:
             try:
-                fl = c.get_filings(form=form)
-                if fl is None:
-                    continue
-                # 修复轮 2 · Important 5：必须先按 days_back 过滤，再用 limit_per
-                # 截断——原来的顺序反了（先切片再过滤），完全依赖"返回按时间倒序"
-                # 这个未经验证的假设，申报密集的票会把窗口内的记录静默截掉。
-                in_window = []
-                for f in fl:
+                filings, complete = _iter_collection_with_status(
+                    company.get_filings(form=form), limit_per)
+                in_window = [f for f in filings
+                             if (not str(getattr(f, "filing_date", ""))[:10]
+                                 or lo <= str(getattr(f, "filing_date", ""))[:10] <= hi)]
+                if not complete:
+                    errs.append(f"{ticker}/{form}:使用 cap {limit_per}，扫描 {len(filings)} 条、窗口内 {len(in_window)} 条，扫描不完整")
+                if len(in_window) > int(limit_per or 0) > 0:
+                    errs.append(f"{ticker}/{form}:窗口内 {len(in_window)} 条，截断 {limit_per} 条")
+                for filing in in_window[:limit_per if limit_per else None]:
                     try:
-                        filed = str(getattr(f, "filing_date", ""))
-                        if filed and filed < cutoff:
-                            continue    # 只保留窗口内的，避免每天重复入库几年的历史
-                        in_window.append(f)
+                        rows.append(_assemble_row(filing, form, now, ticker=ticker,
+                                                  ticker_map=ticker_map))
                     except Exception:
-                        continue
-                if len(in_window) > limit_per:
-                    # 截断真的发生了，不能静默——记一笔让 source_health 看得见
-                    errs.append(f"{tk}/{form}: 窗口内 {len(in_window)} 条，"
-                                f"只取前 {limit_per} 条，{len(in_window)-limit_per} 条被截断")
-                for f in in_window[:limit_per]:
-                    try:
-                        rows.append(_assemble_row(f, form, now, ticker=tk))
-                    except Exception:
-                        continue
-            except Exception as e:
-                errs.append(f"{tk}/{form}:{type(e).__name__}: {e}")
-    # ok 反映「查询过程本身是否顺利」，不是「今天有没有新申报」——
-    # 持仓多数日子本来就没有新的 8-K，这不该被算作数据源故障。
+                        errs.append(f"{ticker}/{form}:row")
+            except Exception as exc:
+                errs.append(f"{ticker}/{form}:{type(exc).__name__}")
     return SourceResult(source="edgar.filings_by_ticker", rows=len(rows), data=rows,
-                        ok=len(errs) == 0, detail="; ".join(errs[:3]))
+                        ok=not errs, detail="; ".join(errs[:3]),
+                        )

@@ -9,8 +9,9 @@
 """
 import re
 
-from .alerts import assert_no_directives, render_alert
+from .alerts import render_alert
 from .notify import assert_no_money, MONEY_RE
+from .policy import assert_no_directives
 
 # 截断收尾用：字符串末尾如果留下一个没有配对「]」的裸「[」，说明是
 # reason[:80] 字符截断把占位符 [金额见面板] 切碎了（见 render_push 的
@@ -29,9 +30,7 @@ def _movers(ctx):
 
 
 def _fmt_line(a, causes):
-    reason = "未找到明确原因"
-    if causes:
-        reason = causes[0]["summary"]
+    reason = _reason(causes)
     return (
         f"**{a['ticker']}**　{a['ret']*100:+.1f}%\n"
         f"　　其中大盘 {a['mkt_part']*100:+.1f}%，"
@@ -39,6 +38,20 @@ def _fmt_line(a, causes):
         f"个股独立 {a['idio']*100:+.1f}%（{a['z']:+.1f}σ）\n"
         f"　　原因：{reason}"
     )
+
+
+def _reason(causes):
+    """区分「没有找到原因」与「部分信源不可用」。"""
+    usable = [c for c in (causes or []) if c.get("summary")]
+    if usable:
+        return usable[0]["summary"]
+    health = getattr(causes, "health", []) if causes is not None else []
+    unavailable = [h.get("source", "unknown") for h in health
+                   if not h.get("ok", False)]
+    if unavailable:
+        return ("未找到明确原因（部分信源不可用："
+                + ", ".join(unavailable) + "；不可用不等于没有原因）")
+    return "未找到明确原因"
 
 
 def render_markdown(ctx):
@@ -122,7 +135,7 @@ def render_push(ctx):
     if movers:
         for a in movers[:5]:
             causes = ctx["causes_by_ticker"].get(a["ticker"]) or []
-            reason = causes[0]["summary"] if causes else "未找到明确原因"
+            reason = _reason(causes)
             # 修复轮 2 Minor：金额替换必须在截断之前做。causes 的 summary
             # 长度不受控（新闻/8-K/LLM 摘要），如果先截到 80 字符再校验，
             # 金额短语恰好跨在第 80 字符边界上时会被切碎——比如

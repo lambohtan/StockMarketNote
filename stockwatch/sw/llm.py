@@ -18,13 +18,22 @@ import json
 import os
 import subprocess
 import sys
+import re
 from pathlib import Path
 
-from .alerts import assert_no_directives
+from .policy import assert_no_directives
 
 ROOT = Path(__file__).resolve().parent.parent
 LLM_WORKDIR = ROOT / "packaging" / "llm-workdir"
 DEFAULT_CLAUDE_BIN = str(Path.home() / ".local" / "bin" / "claude")
+
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"summary": {"type": "string"}},
+    "required": ["summary"],
+    "additionalProperties": False,
+}
+_NUMBER_TOKEN = re.compile(r"(?<!\d)\d[\d,]*(?:\.\d+)?")
 
 
 class LLMConfigError(Exception):
@@ -56,7 +65,7 @@ def _guard(text):
     return text
 
 
-def _guard_or_log(text, store):
+def _guard_or_log(text, store, guard_error=None):
     """
     过守卫；触发时记一条 source_health，而不是和"调用失败"混在一起静默吞掉。
 
@@ -77,9 +86,13 @@ def _guard_or_log(text, store):
     走同一条路，不能让"记日志"这件事本身有能力弄崩调用方。
     """
     try:
+        if guard_error:
+            raise ValueError(guard_error)
         return _guard(text)
     except ValueError as e:
-        detail = f"{e}｜摘要前100字：{text[:100]!r}"
+        # detail 只记录策略类别/短语，不记录 prompt、原始材料、secret 或
+        # 完整模型输出；日志本身不能成为第二条数据泄漏通道。
+        detail = str(e)
         if store is not None:
             try:
                 store.log_health("llm.guard", False, 0, detail)
@@ -90,6 +103,69 @@ def _guard_or_log(text, store):
         return ""
 
 
+def _runtime_fail(store, reason):
+    """运行时失败只记录类型，避免把材料/密钥写进 source_health。"""
+    detail = f"运行时失败：{reason}"
+    if store is not None:
+        try:
+            store.log_health("llm.runtime", False, 0, detail)
+            return
+        except Exception:
+            pass
+    print(f"[llm.runtime] {detail}", file=sys.stderr)
+
+
+def _extract_summary(value, allow_plain=True):
+    """把 CLI/API 的结构化结果归一为 summary 字符串。
+
+    CLI 旧版本仍可能把 ``result`` 作为纯文本返回，因此保留兼容开关；
+    API 边界必须是同一份 JSON schema，调用时关闭纯文本回退。
+    """
+    if isinstance(value, dict):
+        summary = value.get("summary")
+        if isinstance(summary, str):
+            return summary.strip()
+        raise ValueError("结构化输出缺少 summary")
+    if isinstance(value, str):
+        # 兼容旧版 claude CLI 的 result=纯文本；新 schema 输出通常是 JSON
+        # 字符串，优先解析成统一对象。
+        raw = value.strip()
+        if not raw:
+            raise ValueError("结构化输出为空")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            if allow_plain:
+                return raw
+            raise ValueError("结构化输出不是 JSON")
+        return _extract_summary(parsed, allow_plain=allow_plain)
+    raise ValueError("结构化输出类型不正确")
+
+
+def _parse_cli_output(raw):
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("CLI 外层输出不是对象")
+    candidate = data.get("structured_output")
+    if candidate is None:
+        candidate = data.get("structuredOutput")
+    if candidate is None:
+        candidate = data.get("result")
+    return _extract_summary(candidate)
+
+
+def _number_tokens(text):
+    return {m.group(0).replace(",", "") for m in _NUMBER_TOKEN.finditer(text or "")}
+
+
+def _validate_numeric_provenance(summary, material):
+    """每个阿拉伯数字 token 都必须能在输入材料中找到。"""
+    source_numbers = _number_tokens(material)
+    for token in _number_tokens(summary):
+        if token not in source_numbers:
+            raise ValueError("摘要数字未通过来源校验")
+
+
 def build_cli_cmd(cfg, instruction):
     """拼 claude -p 的命令行。单独抽出来是为了能测。"""
     claude_bin = cfg.get("llm.claude_bin") or DEFAULT_CLAUDE_BIN
@@ -97,6 +173,8 @@ def build_cli_cmd(cfg, instruction):
         claude_bin, "-p",
         "--append-system-prompt", instruction,
         "--output-format", "json",
+        "--json-schema", json.dumps(OUTPUT_SCHEMA, ensure_ascii=False,
+                                     separators=(",", ":")),
         # ⚠️ 不要加 --bare：它不读订阅登录
         # ⚠️ 不给任何工具权限：纯文本进，纯文本出
         "--permission-mode", "dontAsk",
@@ -151,11 +229,22 @@ def summarize(cfg, material, instruction=None, dry_run=False, timeout=120, store
             p = subprocess.run(cmd, input=material, capture_output=True,
                                text=True, timeout=timeout, cwd=str(LLM_WORKDIR))
             if p.returncode != 0:
+                _runtime_fail(store, "cli_nonzero")
                 return ""
-            data = json.loads(p.stdout)
-            result = (data.get("result") or "").strip()
-        except Exception:
+            result = _parse_cli_output(p.stdout)
+        except subprocess.TimeoutExpired:
+            _runtime_fail(store, "cli_timeout")
             return ""
+        except (json.JSONDecodeError, ValueError):
+            _runtime_fail(store, "cli_parse")
+            return ""
+        except Exception:
+            _runtime_fail(store, "cli_exception")
+            return ""
+        try:
+            _validate_numeric_provenance(result, material)
+        except ValueError as e:
+            return _guard_or_log(result, store, guard_error=str(e))
         return _guard_or_log(result, store)
 
     # provider == "api"
@@ -171,5 +260,17 @@ def summarize(cfg, material, instruction=None, dry_run=False, timeout=120, store
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
         result = text.strip()
     except Exception:
+        _runtime_fail(store, "api_exception")
+        return ""
+    try:
+        # API content must be a JSON object (or a JSON-encoded object), matching
+        # the CLI schema; unlike the CLI compatibility path, plain text is not
+        # accepted at this boundary.
+        result = _extract_summary(result, allow_plain=False)
+        _validate_numeric_provenance(result, material)
+    except ValueError as e:
+        if "数字" in str(e):
+            return _guard_or_log(result, store, guard_error=str(e))
+        _runtime_fail(store, "api_parse")
         return ""
     return _guard_or_log(result, store)

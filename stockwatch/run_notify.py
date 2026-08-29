@@ -26,13 +26,15 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    st = Store(CFG.db_path)
-    r = NT.drain(st, CFG, dry_run=a.dry_run)
-    print(f"[{datetime.now().isoformat(timespec='seconds')}] "
-          f"发出 {r['sent']} 条，失败 {r['failed']} 条"
-          + ("，已上报计算任务失败" if r["failure_reported"] else ""))
-    st.close()
-    return 0 if r["failed"] == 0 else 1
+    st = Store.open_read_only(CFG.db_path) if a.dry_run else Store(CFG.db_path)
+    try:
+        r = NT.drain(st, CFG, dry_run=a.dry_run)
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] "
+              f"发出 {r['sent']} 条，失败 {r['failed']} 条"
+              + ("，已上报计算任务失败" if r["failure_reported"] else ""))
+        return 0 if r["failed"] == 0 else 1
+    finally:
+        st.close()
 
 
 if __name__ == "__main__":

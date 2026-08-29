@@ -58,6 +58,15 @@ def render_plist(label, args, calendar, workdir, env=None, logs_dir=None):
 
 def plans(cfg, python_bin, workdir):
     """从 config 生成全部任务定义。"""
+    provider = str(cfg.get("llm.provider", "claude_cli")).strip()
+    if provider not in ("claude_cli", "api"):
+        raise ValueError(f"未知的 llm.provider：{provider!r}")
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if provider == "api" and not api_key:
+        # 在任何 plist/launchctl 变更前 fail closed。
+        raise ValueError("llm.provider=api 但没有 ANTHROPIC_API_KEY，拒绝安装")
+    if provider == "claude_cli" and api_key:
+        raise ValueError("llm.provider=claude_cli 但环境存在 ANTHROPIC_API_KEY，拒绝安装")
     dh, dm = _hm(cfg.get("schedule.compute_daily", "06:00"))
     rh, rm = _hm(cfg.get("schedule.compute_retry", "07:00"))
     wh, wm = _hm(cfg.get("schedule.compute_weekly", "06:30"))
@@ -70,10 +79,8 @@ def plans(cfg, python_bin, workdir):
     env = None
     # provider=api 时才把 key 注进任务环境；claude_cli 模式下绝不能带，
     # 否则 Claude Code 会静默改用 API 计费而不是订阅。
-    if cfg.get("llm.provider", "claude_cli") == "api":
-        key = os.environ.get("ANTHROPIC_API_KEY")
-        if key:
-            env = {"ANTHROPIC_API_KEY": key}
+    if provider == "api":
+        env = {"ANTHROPIC_API_KEY": api_key}
 
     return [
         {"label": f"{PREFIX}-compute-daily",
@@ -93,12 +100,14 @@ def plans(cfg, python_bin, workdir):
 
 def apply(cfg, python_bin, workdir, dry_run=False, skip_missing=True):
     """写 plist 并重载。返回已处理的 label 列表。"""
+    # 先完成全部配置校验；API 缺 key 等拒绝路径不能连日志目录都创建。
+    planned = plans(cfg, python_bin, workdir)
     if not dry_run:
         LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
         (Path(workdir) / "logs").mkdir(parents=True, exist_ok=True)
     uid = os.getuid()
     done = []
-    for p in plans(cfg, python_bin, workdir):
+    for p in planned:
         script = Path(p["args"][1])
         # 干跑要完整展示计划，方便核对即将安装的全部 plist；真安装时才
         # 跳过尚未创建的脚本（当前 weekly 入口可能尚未存在）。
@@ -116,17 +125,55 @@ def apply(cfg, python_bin, workdir, dry_run=False, skip_missing=True):
             print(f"--- {target}\n{xml}")
             done.append(p["label"])
             continue
-        target.write_text(xml, encoding="utf-8")
+        # 先以临时文件原子替换，并保留旧 plist；bootstrap 失败时文件和服务
+        # 都回到原状态。所有生成的 plist 固定 0600，防止未来误含 secret。
+        old_exists = target.exists()
+        old_bytes = target.read_bytes() if old_exists else None
+        old_mode = target.stat().st_mode & 0o777 if old_exists else None
+        old_loaded = False
+        if old_exists:
+            # 仅查询旧服务状态；回滚时只恢复原本已加载的 job，避免一个原先
+            # 未加载的 plist 因失败回滚而被意外启动。
+            state = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{p['label']}"],
+                capture_output=True, text=True)
+            old_loaded = getattr(state, "returncode", 1) == 0
+        temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        temp.write_text(xml, encoding="utf-8")
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
         # bootout 允许失败（首次安装时本来就没加载过）
-        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{p['label']}"],
-                       capture_output=True)
-        r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(target)],
-                           capture_output=True, text=True)
-        ok = r.returncode == 0
+        error_detail = ""
+        try:
+            subprocess.run(["launchctl", "bootout", f"gui/{uid}/{p['label']}"],
+                           capture_output=True)
+            r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(target)],
+                               capture_output=True, text=True)
+            ok = r.returncode == 0
+            error_detail = getattr(r, "stderr", "") or ""
+        except Exception as exc:
+            ok = False
+            error_detail = f"{type(exc).__name__}: {exc}"
         print(f"  {'✅' if ok else '❌'} {p['label']} "
-              f"{p['calendar']}{'' if ok else '  ' + r.stderr.strip()[:120]}")
+              f"{p['calendar']}{'' if ok else '  ' + error_detail.strip()[:120]}")
         if ok:
+            os.chmod(target, 0o600)
             done.append(p["label"])
+        else:
+            # 恢复旧 plist，并尝试恢复之前加载的服务。即使恢复 bootstrap
+            # 失败，也不能把新失败误报为成功。
+            try:
+                if old_exists:
+                    restore = target.with_name(f".{target.name}.{os.getpid()}.restore")
+                    restore.write_bytes(old_bytes)
+                    os.chmod(restore, old_mode or 0o600)
+                    os.replace(restore, target)
+                else:
+                    target.unlink(missing_ok=True)
+            finally:
+                if old_exists and old_loaded:
+                    subprocess.run(["launchctl", "bootstrap", f"gui/{uid}/{p['label']}",
+                                    str(target)], capture_output=True, text=True)
     return done
 
 
@@ -140,9 +187,14 @@ def main(argv=None, cfg=None, python_bin=None, workdir=None):
         cfg = CFG
     root = Path(workdir) if workdir else Path(__file__).resolve().parent.parent
     interpreter = python_bin or sys.executable
-    done = apply(cfg, interpreter, str(root), dry_run=dry)
+    try:
+        planned = plans(cfg, interpreter, str(root))
+        done = apply(cfg, interpreter, str(root), dry_run=dry)
+    except ValueError as exc:
+        print(f"❌ 调度配置拒绝安装：{exc}")
+        return 1
     if not dry:
-        expected = {p["label"] for p in plans(cfg, interpreter, str(root))
+        expected = {p["label"] for p in planned
                     if Path(p["args"][1]).exists()}
         failed = expected - set(done)
         if failed:

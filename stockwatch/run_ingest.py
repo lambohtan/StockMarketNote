@@ -60,13 +60,15 @@ def ingest_edgar(st, email, positions_tickers, dry_run=False,
     print(f"  {'✅' if eres.ok else '❌'} 全市场 {eres.rows} 条 ({eres.latency_ms}ms) {eres.detail}")
     if eres.rows > 0 and not dry_run:
         st.insert_ignore_many("edgar_filings", EDGAR_COLS, eres.data)
-    st.log_health(eres.source, eres.ok, eres.latency_ms, eres.detail)
+    if not dry_run:
+        st.log_health(eres.source, eres.ok, eres.latency_ms, eres.detail)
 
     tres = fetch_by_ticker(email, sorted(positions_tickers), forms=("8-K", "4"))
     print(f"  {'✅' if tres.ok else '❌'} 按持仓 {tres.rows} 条 ({tres.latency_ms}ms) {tres.detail}")
     if tres.rows > 0 and not dry_run:
         st.upsert_many("edgar_filings", EDGAR_COLS, tres.data)
-    st.log_health(tres.source, tres.ok, tres.latency_ms, tres.detail)
+    if not dry_run:
+        st.log_health(tres.source, tres.ok, tres.latency_ms, tres.detail)
 
     return eres, tres
 
@@ -78,7 +80,7 @@ def main():
     ap.add_argument("--skip-edgar", action="store_true")
     a = ap.parse_args()
 
-    st = Store(CFG.db_path)
+    st = Store.open_read_only(CFG.db_path) if a.dry_run else Store(CFG.db_path)
     today = date.today().isoformat()
     print(f"StockWatch ingest · {today} · db={CFG.db_path}")
 
@@ -133,14 +135,16 @@ def main():
             print(f"  ⚠️ 剔除未收盘的当日 bar：{dropped}（避免污染回归）")
     if res.ok and not a.dry_run:
         st.upsert_many("prices", ["d","ticker","close","volume"], res.data)
-    st.log_health(res.source, res.ok, res.latency_ms, res.detail)
+    if not a.dry_run:
+        st.log_health(res.source, res.ok, res.latency_ms, res.detail)
 
     mres = P.fetch_meta(sorted(universe))
     print(f"  {'✅' if mres.ok else '❌'} 元数据 {mres.rows} 只 ({mres.latency_ms}ms) {mres.detail}")
     if mres.ok and not a.dry_run:
         st.upsert_many("meta", ["ticker","sector","industry","name","market_cap","updated_at"],
                        mres.data)
-    st.log_health(mres.source, mres.ok, mres.latency_ms, mres.detail)
+    if not a.dry_run:
+        st.log_health(mres.source, mres.ok, mres.latency_ms, mres.detail)
 
     # ---------- 3. Reddit ----------
     hr("3 / 4  Reddit 热度")
@@ -151,7 +155,8 @@ def main():
         st.upsert_many("reddit_rank",
                        ["d","source","ticker","rank","mentions","upvotes",
                         "rank_24h_ago","mentions_24h_ago"], rres.data)
-    st.log_health(rres.source, rres.ok, rres.latency_ms, rres.detail)
+    if not a.dry_run:
+        st.log_health(rres.source, rres.ok, rres.latency_ms, rres.detail)
 
     # ---------- 4. EDGAR ----------
     hr("4 / 4  SEC EDGAR")

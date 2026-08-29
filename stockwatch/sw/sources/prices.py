@@ -84,36 +84,46 @@ def fetch_meta(tickers):
                         detail=("失败: " + ",".join(bad[:5])) if bad else "")
 
 
-def next_earnings(ticker):
-    """
-    财报日期：check_env 显示 get_earnings_dates() 在 pandas 3.x 下会抛错，
-    所以按可靠性依次降级尝试，全部失败返回 None（不让它拖垮整个任务）。
-    """
+@timed("yfinance.earnings")
+def fetch_earnings(ticker):
+    """财报日期适配器，区分「窗口无日期」和「所有查询失败」。"""
+    from datetime import datetime
     tk = yf.Ticker(ticker)
-    # 1) calendar
+    errors = []
     try:
         cal = tk.calendar
         if isinstance(cal, dict):
-            v = cal.get("Earnings Date")
-            if v:
-                return str(v[0] if isinstance(v, (list, tuple)) else v)
+            value = cal.get("Earnings Date")
+            if value:
+                value = value[0] if isinstance(value, (list, tuple)) else value
+                return SourceResult(source="yfinance.earnings", rows=1,
+                                    data=[str(value)])
         elif isinstance(cal, pd.DataFrame) and not cal.empty:
-            return str(cal.iloc[0, 0])
-    except Exception:
-        pass
-    # 2) get_earnings_dates
+            return SourceResult(source="yfinance.earnings", rows=1,
+                                data=[str(cal.iloc[0, 0])])
+    except Exception as exc:
+        errors.append(type(exc).__name__)
     try:
         ed = tk.get_earnings_dates(limit=4)
         if ed is not None and len(ed):
-            return str(ed.index[0])
-    except Exception:
-        pass
-    # 3) info 时间戳
+            return SourceResult(source="yfinance.earnings", rows=1,
+                                data=[str(ed.index[0])])
+    except Exception as exc:
+        errors.append(type(exc).__name__)
     try:
-        from datetime import datetime
-        ts = (tk.info or {}).get("earningsTimestamp")
-        if ts:
-            return datetime.fromtimestamp(ts).isoformat()
-    except Exception:
-        pass
-    return None
+        timestamp = (tk.info or {}).get("earningsTimestamp")
+        if timestamp:
+            return SourceResult(source="yfinance.earnings", rows=1,
+                                data=[datetime.fromtimestamp(timestamp).isoformat()])
+    except Exception as exc:
+        errors.append(type(exc).__name__)
+    return SourceResult(source="yfinance.earnings", rows=0, data=[],
+                        ok=not errors,
+                        detail=("查询失败：" + ",".join(errors[:3])) if errors
+                                else "窗口内无财报日期")
+
+
+def next_earnings(ticker):
+    """兼容旧接口，只返回日期字符串；状态由 fetch_earnings 提供。"""
+    result = fetch_earnings(ticker)
+    return (result.data or [None])[0]
