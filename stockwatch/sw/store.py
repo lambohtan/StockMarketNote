@@ -126,18 +126,19 @@ CREATE INDEX IF NOT EXISTS idx_filing_texts_ticker ON filing_texts(ticker, filed
 -- P4：深读结果快照，只追加。带模型名，换模型时能区分是模型变了还是公司变了。
 -- 这也是 P7 信号有效性追踪的数据基础，从第一天就要写。
 CREATE TABLE IF NOT EXISTS deepread_results (
-  d             TEXT NOT NULL,
-  ticker        TEXT NOT NULL,
-  source        TEXT NOT NULL,
-  py_hits       TEXT NOT NULL,
-  llm_hits      TEXT NOT NULL,
-  disagreements INTEGER NOT NULL,
-  score_hit     INTEGER NOT NULL,
-  score_total   INTEGER NOT NULL,
-  label         TEXT NOT NULL,
-  narrative     TEXT NOT NULL,
-  model         TEXT NOT NULL,
-  created_at    TEXT NOT NULL,
+  d                     TEXT NOT NULL,
+  ticker                TEXT NOT NULL,
+  source                TEXT NOT NULL,
+  py_hits               TEXT NOT NULL,
+  llm_hits              TEXT NOT NULL,
+  disagreements         INTEGER NOT NULL,
+  disagreements_detail  TEXT NOT NULL DEFAULT '[]',
+  score_hit             INTEGER NOT NULL,
+  score_total           INTEGER NOT NULL,
+  label                 TEXT NOT NULL,
+  narrative             TEXT NOT NULL,
+  model                 TEXT NOT NULL,
+  created_at            TEXT NOT NULL,
   PRIMARY KEY (d, ticker)
 );
 """
@@ -161,6 +162,11 @@ class Store:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
+        # P4 在 06:45 插进一个会跑几分钟的新写入者（run_pool），夹在 weekly
+        # 06:30 与 retry 07:00 之间；sqlite3 默认 busy_timeout 是 0，撞锁
+        # 立即抛 "database is locked"，不会等对方提交。30 秒足够盖过一次
+        # 正常事务的写入时长，又不会让调用方无限期挂起。
+        self.conn.execute("PRAGMA busy_timeout=30000")
         if not self.read_only:
             self.conn.executescript(SCHEMA)
             self._migrate()
@@ -196,6 +202,10 @@ class Store:
             ],
             "alerts": [("logical_date", "TEXT"), ("event_key", "TEXT")],
             "reports": [("logical_date", "TEXT")],
+            # I5 修复：老库（本分支早期 CREATE TABLE 落地过 deepread_results
+            # 之后）不会自动补上后加的列——CREATE TABLE IF NOT EXISTS 遇到
+            # 已存在的表直接跳过，跟 Task 2 那条 deferred minor 是同一个机制。
+            "deepread_results": [("disagreements_detail", "TEXT")],
         }
         for table, cols in migrations.items():
             have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}

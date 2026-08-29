@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sw.store import Store
 from sw import outbox as OB
+from sw import notify as NT
 
 FAIL = []
 
@@ -72,8 +73,61 @@ def test_unknown_kind_still_rejected():
     st.close()
 
 
+def test_notify_tags_covers_pool_kind():
+    """notify.TAGS 缺 'pool' 键时 TAGS.get(row['kind']) 退化成 None——
+    不影响发送，但推送在 ntfy 客户端里没有图标，跟其它 kind 观感不一致。"""
+    check("TAGS 里有 pool 键", "pool" in NT.TAGS, True)
+
+
+def test_busy_timeout_set():
+    """P4 在 06:45 插进一个会跑几分钟的新写入者，夹在 weekly 06:30 与
+    retry 07:00 之间；sqlite3 默认 busy_timeout=0，撞锁立即报
+    'database is locked'，不会等对方提交完。"""
+    st = fresh_store()
+    v = st.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    check("busy_timeout 已设置为非零", v > 0, True)
+    st.close()
+
+
+def test_deepread_results_has_disagreements_detail_column():
+    """I5：disagreements 列只是计数，分歧的具体内容存进这一列。"""
+    st = fresh_store()
+    cols = {r[1] for r in st.conn.execute("PRAGMA table_info(deepread_results)")}
+    check("disagreements_detail 列存在", "disagreements_detail" in cols, True)
+    st.close()
+
+
+def test_old_deepread_results_table_gets_backfilled_column():
+    """老库在这条修复落地前就建过 deepread_results（没有这一列）——
+    CREATE TABLE IF NOT EXISTS 遇到已存在的表会跳过，得靠 _migrate() 补列，
+    否则老库上跑新代码会在 INSERT 时报"列数不对"。
+    """
+    import sqlite3
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); tmp.close()
+    conn = sqlite3.connect(tmp.name)
+    conn.execute("""
+        CREATE TABLE deepread_results (
+          d TEXT NOT NULL, ticker TEXT NOT NULL, source TEXT NOT NULL,
+          py_hits TEXT NOT NULL, llm_hits TEXT NOT NULL,
+          disagreements INTEGER NOT NULL, score_hit INTEGER NOT NULL,
+          score_total INTEGER NOT NULL, label TEXT NOT NULL,
+          narrative TEXT NOT NULL, model TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY (d, ticker)
+        )
+    """)
+    conn.commit()
+    conn.close()
+    st = Store(tmp.name)   # 触发 _migrate()
+    cols = {r[1] for r in st.conn.execute("PRAGMA table_info(deepread_results)")}
+    check("旧库补上了 disagreements_detail 列", "disagreements_detail" in cols, True)
+    st.close()
+
+
 for fn in (test_tables_exist, test_filing_texts_unique,
-           test_outbox_accepts_pool, test_unknown_kind_still_rejected):
+           test_outbox_accepts_pool, test_unknown_kind_still_rejected,
+           test_notify_tags_covers_pool_kind,
+           test_busy_timeout_set, test_deepread_results_has_disagreements_detail_column,
+           test_old_deepread_results_table_gets_backfilled_column):
     print(fn.__name__)
     fn()
 

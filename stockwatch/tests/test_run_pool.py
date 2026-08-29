@@ -6,6 +6,11 @@
   - --dry-run 的进程入口（main()）不联网、不调 LLM（裁定 1 的额外测试）
   - 单只票失败不拖垮其余票
   - 结果落 deepread_results，一天一票一行（P7 回看的数据基础）
+
+修复轮补充（I4/I5/I6）：
+  - 行业未映射到 ETF 的持仓仍进归因结果；单票归因异常不拖垮其余持仓
+  - deepread_results.llm_hits 落库的是完整的 8 条 + 引用，不是只有 2 条文本判定
+  - 入池但全部深读失败必须推送；今天没有票入池不需要推送
 """
 import contextlib
 import io
@@ -13,6 +18,7 @@ import sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sw.store import Store
+from sw.analysis import portfolio as PF
 import run_pool
 
 FAIL = []
@@ -177,9 +183,178 @@ def test_dry_run_process_is_offline_and_read_only():
     ro.close()
 
 
+def test_emit_persists_full_llm_hits_and_disagreements_detail():
+    """I5：deepread_results.llm_hits 要落完整的 8 条判定 + 引用，
+    disagreements_detail 要落分歧的具体内容，不能只存计数。
+
+    这张表存在的唯一理由是"一年后回看当时是怎么判的"和 P7 信号有效性
+    追踪——交叉验证的证据恰恰是最该留的那部分，只存 2 条文本判定等于
+    把 6 条对照判定和全部引用永久丢弃。
+    """
+    import json as _json
+    st = fresh_store()
+    tmpdir = tempfile.mkdtemp()
+    dis = [{"key": "gross_margin", "label": "毛利率环比未恶化", "py": True,
+            "llm": False, "py_detail": "毛利率环比 -0.4pt",
+            "llm_quote": "we expect gross margin to normalize"}]
+    item = fake_item(
+        "NVDA",
+        llm_hits={"revenue_growth": True, "gross_margin": False},
+        llm_quotes={"gross_margin": "we expect gross margin to normalize"},
+        text_hits={"guidance_direction": False, "no_new_risk": True},
+        text_quotes={"guidance_direction": "…"},
+        disagreements=dis,
+    )
+    run_pool.emit(st, Cfg(), "2026-08-29", [item], report_dir=tmpdir)
+    row = st.q("SELECT llm_hits, disagreements, disagreements_detail "
+              "FROM deepread_results WHERE ticker='NVDA'")[0]
+    stored = _json.loads(row["llm_hits"])
+    check("落库的 llm_hits 含 6 条对照判定",
+          stored.get("hits", {}).get("revenue_growth"), True)
+    check("落库的 llm_hits 含引用",
+          "normalize" in stored.get("quotes", {}).get("gross_margin", ""), True)
+    check("落库的 llm_hits 含 2 条文本判定",
+          stored.get("text_hits", {}).get("no_new_risk"), True)
+    check("disagreements 仍是计数", row["disagreements"], 1)
+    stored_dis = _json.loads(row["disagreements_detail"])
+    check("disagreements_detail 存了分歧的具体内容",
+          stored_dis[0]["llm_quote"], "we expect gross margin to normalize")
+    st.close()
+
+
+def test_attributions_includes_unmapped_sector_and_survives_single_failure():
+    """I4：run_pool._attributions 要和 run_daily.build_context 的写法对齐。
+
+    此前两处都反了：① 行业未映射到 ETF 时直接 `continue` 跳过这只持仓——
+    但 AT.attribute 的 docstring 明说 sector_etf=None 会退化为单因子，
+    不是不能算，跳过会让"行业未知的持仓即使极端异动也进不了深读池"，
+    与 spec「持仓异动全读」矛盾；② try/except 包住整个循环，任意一只票
+    抛异常就让整个函数返回 []，当天 holding_anomaly 这个来源整个消失。
+    """
+    st = fresh_store()
+    holdings = [
+        PF.Holding(ticker="NVDA", sector="Technology"),
+        PF.Holding(ticker="WEIRD", sector=None),        # 行业未映射
+        PF.Holding(ticker="BOOM", sector="Technology"),
+    ]
+
+    calls = []
+
+    def fake_attribute(store, ticker, etf, market, window):
+        calls.append((ticker, etf))
+        if ticker == "BOOM":
+            raise RuntimeError("归因挂了")
+        return {"ticker": ticker, "etf": etf, "level": "anomaly", "z": 3.0}
+
+    old = run_pool.AT.attribute
+    run_pool.AT.attribute = fake_attribute
+    try:
+        out = run_pool._attributions(st, Cfg(), "2026-08-29", holdings)
+    finally:
+        run_pool.AT.attribute = old
+
+    tickers = {r["ticker"] for r in out}
+    check("行业未映射的持仓仍进结果（不是 continue 跳过）", "WEIRD" in tickers, True)
+    check("行业未映射时 etf 传的是 None（退化为单因子，不是被跳过）",
+          dict(calls)["WEIRD"], None)
+    check("挂掉的那只不进结果，但不影响其余", "BOOM" in tickers, False)
+    check("BOOM 之后的循环仍然继续（try/except 是逐票的）",
+          "NVDA" in tickers, True)
+    st.close()
+
+
+def test_empty_pool_produces_no_alert():
+    """I6：今天没有票入池是正常情况（没有触发入池条件的信号），不该推送。
+
+    与"入池但全灭"区分开：entries 本身为空时 emit() 照常写一份「0 只」的
+    报告，不需要额外的 kind='pool' 警报。
+    """
+    st = fresh_store()
+    path = Path(st.path)
+    st.close()
+    tmpdir = tempfile.mkdtemp()
+
+    def fake_pool_build(store, cfg, d, attributions=None, new_slots=3):
+        return []
+
+    class ProcessCfg(Cfg):
+        db_path = str(path)
+
+    old = (run_pool.CFG, run_pool.PL.build, run_pool.REPORTS_DIR)
+    old_argv = sys.argv
+    run_pool.CFG = ProcessCfg()
+    run_pool.PL.build = fake_pool_build
+    run_pool.REPORTS_DIR = Path(tmpdir)
+    try:
+        sys.argv = ["run_pool.py", "--date", "2026-08-29"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = run_pool.main()
+    finally:
+        run_pool.CFG, run_pool.PL.build, run_pool.REPORTS_DIR = old
+        sys.argv = old_argv
+
+    check("main 正常退出", rc, 0)
+    chk = Store(str(path))
+    rows = chk.q("SELECT kind FROM outbox")
+    check("空池子不推送任何东西", rows, [])
+    check("仍然写了报告", (Path(tmpdir) / "pool_2026-08-29.md").exists(), True)
+    chk.close()
+
+
+def test_all_tickers_failed_triggers_pool_alert():
+    """I6：入池 N 只但全部深读失败——必须推一条 kind='pool' 高优先级通知。
+
+    notify.drain 的看门狗只认 kind='daily'，不会替 run_pool 兜底；
+    spec §8：所有源失败要以 kind='pool' 推一条「今日股票池深读未产出」，
+    沉默不等于没事。
+    """
+    st = fresh_store()
+    path = Path(st.path)
+    st.close()
+    tmpdir = tempfile.mkdtemp()
+
+    def fake_pool_build(store, cfg, d, attributions=None, new_slots=3):
+        return [{"ticker": "BAD", "source": "apewisdom", "reason": "r",
+                "strength": 1}]
+
+    def failing_one_item(store, cfg, d, entry, held=None):
+        raise RuntimeError("模拟深读失败")
+
+    class ProcessCfg(Cfg):
+        db_path = str(path)
+
+    old = (run_pool.CFG, run_pool.PL.build, run_pool.one_item, run_pool.REPORTS_DIR)
+    old_argv = sys.argv
+    run_pool.CFG = ProcessCfg()
+    run_pool.PL.build = fake_pool_build
+    run_pool.one_item = failing_one_item
+    run_pool.REPORTS_DIR = Path(tmpdir)
+    try:
+        sys.argv = ["run_pool.py", "--date", "2026-08-29"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = run_pool.main()
+    finally:
+        (run_pool.CFG, run_pool.PL.build, run_pool.one_item,
+         run_pool.REPORTS_DIR) = old
+        sys.argv = old_argv
+
+    check("main 正常退出", rc, 0)
+    chk = Store(str(path))
+    rows = chk.q("SELECT kind, priority FROM outbox")
+    check("入队了一条高优先级 pool 警报",
+          [(r["kind"], r["priority"]) for r in rows], [("pool", "high")])
+    health = chk.q("SELECT ok FROM source_health WHERE source='run_pool'")
+    check("失败留痕", any(r["ok"] == 0 for r in health), True)
+    chk.close()
+
+
 for fn in (test_emit_writes_outbox_and_results, test_emit_is_idempotent,
            test_dry_run_writes_nothing, test_one_ticker_failure_does_not_stop_others,
-           test_dry_run_process_is_offline_and_read_only):
+           test_dry_run_process_is_offline_and_read_only,
+           test_emit_persists_full_llm_hits_and_disagreements_detail,
+           test_attributions_includes_unmapped_sector_and_survives_single_failure,
+           test_empty_pool_produces_no_alert,
+           test_all_tickers_failed_triggers_pool_alert):
     print(fn.__name__)
     fn()
 

@@ -39,30 +39,56 @@ def log(message):
     print(f"[{datetime.now().isoformat(timespec='seconds')}] {message}", flush=True)
 
 
-def _attributions(store, cfg, d):
-    """就地重算持仓归因，只为拿到「哪几只异动」。纯本地计算，不联网。"""
+def _held_tickers(store, cfg):
+    """当前持仓代码列表。没有持仓快照时返回空列表（相关性那条判 None，
+    不影响其余五条）——`one_item`/`one_item_dry_run` 在没被显式传入
+    `held` 时各自回退到这里，两处共享同一份异常处理，不再逐字重复。
+    """
     try:
-        # PF.build 返回 Portfolio 数据类，holdings 是 Holding 对象列表（不是 dict），
-        # 且库里没有持仓快照时会抛 ValueError —— 一并由外层 except 兜住。
-        portfolio = PF.build(store, cfg)
-        sectors = cfg.get("benchmarks.sectors") or {}
-        market = cfg.get("benchmarks.market", "SPY")
-        out = []
-        for h in portfolio.holdings:
-            etf = sectors.get(h.sector)
-            if not etf:
-                continue
-            r = AT.attribute(store, h.ticker, etf, market, 60)
-            if r:
-                out.append(r)
-        return out
-    except Exception as exc:
-        log(f"  ⚠️ 归因重算失败，本次只用热度与 Form 4 入池：{type(exc).__name__}: {exc}")
+        return [h.ticker for h in PF.build(store, cfg).holdings]
+    except Exception:
         return []
 
 
-def one_item(store, cfg, d, entry):
-    """跑完一只票的完整深读。任何一步失败由调用方捕获。"""
+def _attributions(store, cfg, d, holdings):
+    """就地重算持仓归因，只为拿到「哪几只异动」。纯本地计算，不联网。
+
+    ``holdings`` 由调用方（``main()``）传入，是已经 ``PF.build()`` 过一次的
+    持仓列表 —— 不在这里重新查库，避免一天里对同一份持仓快照重复建
+    Portfolio。
+
+    与 ``run_daily.build_context`` 的写法对齐（此前这里两处都反了，是 I4
+    修复的内容）：
+      1. 行业未映射到 ETF 时 ``etf`` 取 ``None`` 而不是 ``continue`` 跳过
+         这只持仓 —— ``AT.attribute`` 的 docstring 明说 ``sector_etf=None``
+         会退化为单因子，不是不能算。原来的 ``continue`` 会让「行业未知」
+         的持仓即使被判极端异动也进不了深读池，与 spec「持仓异动全读」矛盾。
+      2. try/except 是**逐票**的，不是包住整个循环 —— 原来任意一只票的
+         ``AT.attribute`` 抛异常会让整个函数返回 ``[]``，当天
+         ``holding_anomaly`` 这个来源整个消失；改成单票失败只跳过那一只，
+         其余持仓照常参与归因。
+    """
+    sectors = cfg.get("benchmarks.sectors") or {}
+    market = cfg.get("benchmarks.market", "SPY")
+    out = []
+    for h in holdings:
+        etf = sectors.get(h.sector) if h.sector else None
+        try:
+            r = AT.attribute(store, h.ticker, etf, market, 60)
+        except Exception as exc:
+            log(f"  ⚠️ {h.ticker} 归因失败：{type(exc).__name__}: {exc}")
+            r = None
+        if r:
+            out.append(r)
+    return out
+
+
+def one_item(store, cfg, d, entry, held=None):
+    """跑完一只票的完整深读。任何一步失败由调用方捕获。
+
+    ``held``：当前持仓代码列表，`main()` 在一天里只算一次后传入；
+    未传入（比如测试直接调用）时回退到 `_held_tickers()` 自己查一次。
+    """
     ticker = entry["ticker"]
     email = cfg.get("identity.sec_email")
 
@@ -76,10 +102,7 @@ def one_item(store, cfg, d, entry):
     nr = NF.fetch(ticker, max_items=4)
     store.log_health(nr.source, nr.ok, nr.latency_ms, f"{ticker} {nr.detail}")
 
-    try:
-        held = [h.ticker for h in PF.build(store, cfg).holdings]
-    except Exception:
-        held = []          # 没有持仓快照时相关性那条判 None，不影响其余五条
+    held = _held_tickers(store, cfg) if held is None else held
     facts = FA.collect(store, cfg, ticker, d, held_tickers=held)
     py = CR.evaluate(facts)
 
@@ -91,7 +114,7 @@ def one_item(store, cfg, d, entry):
     return item
 
 
-def one_item_dry_run(store, cfg, d, entry):
+def one_item_dry_run(store, cfg, d, entry, held=None):
     """干跑单只票：只读库内已有数据，绝不联网、绝不调 LLM（裁定 1）。
 
     与 ``one_item`` 的差别：
@@ -104,10 +127,7 @@ def one_item_dry_run(store, cfg, d, entry):
         六条的命中/总数套 ``DR.label_for`` 得到标签，叙述用固定占位文案。
     """
     ticker = entry["ticker"]
-    try:
-        held = [h.ticker for h in PF.build(store, cfg).holdings]
-    except Exception:
-        held = []
+    held = _held_tickers(store, cfg) if held is None else held
     facts = FA.collect(store, cfg, ticker, d, held_tickers=held,
                        fin=lambda _ticker: {})
     py = CR.evaluate(facts)
@@ -138,7 +158,17 @@ def build_items(store, cfg, d, entries, one_item=one_item):
 
 
 def emit(store, cfg, d, items, dry_run=False, report_dir=None):
-    """写报告、落结果、入队。一只票一条推送。"""
+    """写报告、落结果、入队。一只票一条推送。
+
+    I5 修复：``deepread_results.llm_hits`` 按 spec §4 应该是「8 条 LLM 判定
+    + 引用」，此前只写了 ``text_hits``（2 条文本判定），LLM 对 py 那 6 条
+    的独立对照判定（``llm_hits``/``llm_quotes``）从未落库。这张表存在的
+    唯一理由是「一年后回看当时是怎么判的」和 P7 信号有效性追踪——交叉
+    验证的证据恰恰是最该留的那部分，所以这里把 stage2 带出来的
+    ``llm_hits``/``llm_quotes``/``text_hits``/``text_quotes`` 四件套整个
+    存成一个 JSON 对象；``disagreements`` 列仍是计数（不改 spec 的列
+    类型），分歧的具体内容存进新增的 ``disagreements_detail`` 列。
+    """
     markdown = RD.render_report(d, items)
     if dry_run:
         print(markdown)
@@ -152,14 +182,22 @@ def emit(store, cfg, d, items, dry_run=False, report_dir=None):
     inserted = 0
     with store.tx() as c:
         for item in items:
+            llm_hits_full = {
+                "hits": item.get("llm_hits") or {},
+                "quotes": item.get("llm_quotes") or {},
+                "text_hits": item.get("text_hits") or {},
+                "text_quotes": item.get("text_quotes") or {},
+            }
             c.execute(
                 "INSERT OR REPLACE INTO deepread_results(d,ticker,source,py_hits,"
-                "llm_hits,disagreements,score_hit,score_total,label,narrative,"
-                "model,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "llm_hits,disagreements,disagreements_detail,score_hit,score_total,"
+                "label,narrative,model,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (d, item["ticker"], item.get("source", ""),
                  json.dumps(item["py"]["hits"], ensure_ascii=False),
-                 json.dumps(item.get("text_hits") or {}, ensure_ascii=False),
-                 len(item.get("disagreements") or []), item["hit"], item["total"],
+                 json.dumps(llm_hits_full, ensure_ascii=False),
+                 len(item.get("disagreements") or []),
+                 json.dumps(item.get("disagreements") or [], ensure_ascii=False),
+                 item["hit"], item["total"],
                  item["label"], item["narrative"], item["model"], now))
         c.execute(
             "INSERT INTO reports(d,kind,body_md,created_at,logical_date) VALUES (?,?,?,?,?) "
@@ -183,6 +221,30 @@ def emit(store, cfg, d, items, dry_run=False, report_dir=None):
     return inserted
 
 
+def _alert_all_failed(store, d, n_entries):
+    """入池 N 只但全部深读失败：必须推送，沉默不等于没事（spec §8：I6）。
+
+    与「今天没有票入池」区分开——那种情况 ``entries`` 本身就是空的，是
+    正常的「没有票触发入池条件」，``emit()`` 会照常写一份「0 只」的报告，
+    不需要额外推送。这里是相反的情形：明明入池了，却一只都没读出结果，
+    看门狗必须能看到。``notify.drain`` 的看门狗只认 ``kind='daily'``，
+    不会替 ``run_pool`` 兜底，所以这条警报只能在这里显式入队。
+    """
+    title = f"股票池深读 {d} 未产出"
+    body = (f"今日入池 {n_entries} 只，但全部深读失败，本次没有任何一只票产出结果。\n"
+            "详情见 source_health 里的 deepread 记录。")
+    try:
+        OB.enqueue(store, "pool", title, body, priority="high",
+                   logical_date=d, event_key=f"pool-all-failed:{d}")
+    except Exception:
+        pass
+    try:
+        store.log_health("run_pool", False, 0,
+                         f"入池 {n_entries} 只但全部深读失败")
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -193,13 +255,29 @@ def main():
     d = a.date or local_logical_date()
     st = Store.open_read_only(CFG.db_path) if a.dry_run else Store(CFG.db_path)
     try:
-        entries = PL.build(st, CFG, d, attributions=_attributions(st, CFG, d),
+        # 一天只建一次 Portfolio：_attributions 要完整 Holding 对象算行业
+        # 归因，one_item/one_item_dry_run 只要代码列表算相关性——此前两处
+        # 各自独立调 PF.build，一天里对同一份持仓快照重复查库 N+1 次。
+        try:
+            holdings = PF.build(st, CFG).holdings
+        except Exception as exc:
+            log(f"  ⚠️ 持仓读取失败，本次只用热度与 Form 4 入池：{type(exc).__name__}: {exc}")
+            holdings = []
+        held = [h.ticker for h in holdings]
+
+        entries = PL.build(st, CFG, d, attributions=_attributions(st, CFG, d, holdings),
                            new_slots=a.limit)
         log(f"入池 {len(entries)} 只：" + ", ".join(e["ticker"] for e in entries))
         # 裁定 1：干跑换一条完全离线的单只票处理路径，不联网、不调 LLM。
-        item_fn = one_item_dry_run if a.dry_run else one_item
+        if a.dry_run:
+            item_fn = lambda s, c, dd, e: one_item_dry_run(s, c, dd, e, held=held)
+        else:
+            item_fn = lambda s, c, dd, e: one_item(s, c, dd, e, held=held)
         items = build_items(st, CFG, d, entries, one_item=item_fn)
         log(f"深读成功 {len(items)} 只")
+        # I6：入池了但一只都没读出来，必须响亮，不能悄悄写一份空报告了事。
+        if entries and not items and not a.dry_run:
+            _alert_all_failed(st, d, len(entries))
         n = emit(st, CFG, d, items, dry_run=a.dry_run)
         log(f"入队 {n} 条")
         return 0

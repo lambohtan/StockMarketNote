@@ -24,6 +24,7 @@ TAGS = {
     "weekly": "calendar",
     "l1": "rotating_light",
     "failure": "x",
+    "pool": "mag",   # P4 股票池深读：一只票一条，用放大镜区别于日报的走势图标
 }
 
 
