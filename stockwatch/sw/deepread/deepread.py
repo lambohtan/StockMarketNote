@@ -34,6 +34,29 @@ TEXT_CRITERIA = [
     {"key": "no_new_risk", "label": "风险因素无新增重大项"},
 ]
 
+PY_KEYS = tuple(c["key"] for c in CRITERIA)
+TEXT_KEYS = tuple(c["key"] for c in TEXT_CRITERIA)
+
+# stage1 的输出形状。CLI 走 --json-schema，模型照这个形状回；但 schema 只是
+# 提示，**真正的白名单在 _clean_text_hits()** —— 计分的分子和分母绝不能由
+# 模型的输出决定（硬约束 2）。
+_TRISTATE = {"type": ["boolean", "null"]}
+STAGE1_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "hits": {"type": "object",
+                 "properties": {k: dict(_TRISTATE) for k in PY_KEYS}},
+        "quotes": {"type": "object",
+                   "properties": {k: {"type": "string"} for k in PY_KEYS}},
+        "text_hits": {"type": "object",
+                      "properties": {k: dict(_TRISTATE) for k in TEXT_KEYS}},
+        "text_quotes": {"type": "object",
+                        "properties": {k: {"type": "string"} for k in TEXT_KEYS}},
+    },
+    "required": ["hits", "quotes", "text_hits", "text_quotes"],
+    "additionalProperties": False,
+}
+
 STAGE1_INSTRUCTION = """你在读一家美股公司的财报正文与新闻。只输出 JSON，不要解释。
 
 格式：
@@ -69,7 +92,9 @@ STAGE2_INSTRUCTION = """你在写一份个人投资研究笔记的一只股票�
 硬性要求：
 - 不要给出买卖建议、目标价、仓位比例，不要用祈使句指挥读者
 - 不要写任何美元金额
-- 只使用给定材料里的数字，不要自己算新数字
+- **只使用给定材料里出现过的数字**。材料里的小数可以写成百分比
+  （0.94 写成 94%），但不要自己做加减乘除、不要估算、不要引入材料里
+  没有的任何百分比、倍数或金额。拿不准就不写数字，改用定性描述。
 - 如果 py 与 LLM 的判定有分歧，在「发生了什么」里点明分歧在哪一条"""
 
 
@@ -117,8 +142,25 @@ def _accepts_store(fn):
     return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-def _call(cfg, caller, material, instruction, store):
-    fn = caller if caller is not None else LM.summarize
+def _default_stage1_caller(cfg, material, instruction, store=None):
+    """stage1 的真实出口：结构化 JSON，不是摘要。
+
+    **不能接 LM.summarize**：那条路无条件拼 SYSTEM（第 5 条「两句话以内」），
+    且 CLI 的 json-schema 固定为 {"summary": string} + additionalProperties
+    false，`{"hits":...,"quotes":...}` 在那条路径上根本回不来 —— 生产上
+    stage1 会稳定返回空判定，双路判定静默退化成单路，而报告只写「LLM 深读
+    失败」，从外面看不出是接线接错了。
+    """
+    return LM.complete_json(cfg, material, instruction, STAGE1_SCHEMA, store=store)
+
+
+def _default_stage2_caller(cfg, material, instruction, store=None):
+    """stage2 的真实出口：四段长文，走长文 schema 与放宽后的数字口径。"""
+    return LM.complete_text(cfg, material, instruction, store=store)
+
+
+def _call(cfg, caller, material, instruction, store, default_fn):
+    fn = caller if caller is not None else default_fn
     try:
         if _accepts_store(fn):
             return fn(cfg, material, instruction, store=store) or ""
@@ -132,7 +174,8 @@ def _call(cfg, caller, material, instruction, store):
 
 def stage1(cfg, ticker, material, store=None, caller=None):
     """LLM 独立判定。解析失败一律退化成空判定，绝不抛异常（LLMConfigError 除外）。"""
-    raw = _call(cfg, caller, material, STAGE1_INSTRUCTION, store)
+    raw = _call(cfg, caller, material, STAGE1_INSTRUCTION, store,
+                _default_stage1_caller)
     empty = {"hits": {}, "quotes": {}, "text_hits": {}, "text_quotes": {}}
     if not raw:
         return empty
@@ -176,33 +219,61 @@ def label_for(hit, total, n_disagree):
     return {"label": label, "note": note}
 
 
+def clean_text_hits(raw):
+    """把 LLM 的两条文本判定归一成「白名单 key + 严格三态」。
+
+    **LLM 绝不能控制计分的分子和分母**（硬约束 2「LLM 不产任何数字」）。
+    不做这一层过滤时，模型多返回四个自造 key 就能把 5/6 变成 11/12「偏正面」，
+    而 `X/Y` 是推送标题和报告首行最醒目的数字，报告里还看不出多出来的是什么；
+    返回字符串 `"false"` / `"no"` 也会被算成命中（非空字符串在 Python 里为真）。
+
+    所以：key 只取 TEXT_CRITERIA 白名单，值只认 `is True` / `is False`，
+    其余一律折成 None（记 unknown、缩小分母，正是 spec §6 对「取不到数」的
+    要求 —— 不把「看不懂的回答」伪装成「不符合」）。返回值恒含且只含两个 key。
+    """
+    out = {}
+    for key in TEXT_KEYS:
+        v = (raw or {}).get(key)
+        out[key] = v if (v is True or v is False) else None
+    return out
+
+
 def stage2(cfg, ticker, py_result, llm_result, facts, store=None, caller=None):
     """汇总两路结论 + 写四段。计分 = py 的 6 条 + LLM 的 2 条文本判定。"""
-    text_hits = (llm_result or {}).get("text_hits") or {}
+    text_hits = clean_text_hits((llm_result or {}).get("text_hits"))
     known_text = {k: v for k, v in text_hits.items() if v is not None}
     hit = py_result["hit"] + sum(1 for v in known_text.values() if v)
     total = py_result["total"] + len(known_text)
     dis = disagreements(py_result, llm_result)
     tag = label_for(hit, total, len(dis))
 
+    llm_hits = (llm_result or {}).get("hits") or {}
+    llm_quotes = (llm_result or {}).get("quotes") or {}
+    text_quotes = (llm_result or {}).get("text_quotes") or {}
+
     material = json.dumps({
         "ticker": ticker,
         "py_判定": {k: py_result["details"].get(k) for k in py_result["hits"]},
         "py_命中": py_result["hits"],
-        "llm_判定": (llm_result or {}).get("hits") or {},
+        "llm_判定": llm_hits,
         "llm_文本判定": text_hits,
-        "llm_引用": (llm_result or {}).get("quotes") or {},
+        "llm_引用": llm_quotes,
         "分歧": [{"条目": d["label"], "py": d["py"], "llm": d["llm"]} for d in dis],
+        "命中计分": f"{hit}/{total}",
         "原始数字": {k: v for k, v in facts.items() if k != "missing"},
     }, ensure_ascii=False)
-    narrative = _call(cfg, caller, material, STAGE2_INSTRUCTION, store)
+    narrative = _call(cfg, caller, material, STAGE2_INSTRUCTION, store,
+                      _default_stage2_caller)
     if not narrative:
         narrative = ("LLM 深读失败，本节只有确定性计算的部分。"
                      "四段叙述缺失，不代表没有值得看的东西。")
 
+    # llm_hits / llm_quotes 必须带出来：deepread_results 存在的理由就是
+    # 「一年后回看当时是怎么判的」，交叉验证的证据是最该留的那部分。
     return {"ticker": ticker, "label": tag["label"], "note": tag["note"],
             "hit": hit, "total": total, "narrative": narrative,
             "disagreements": dis, "text_hits": text_hits,
-            "text_quotes": (llm_result or {}).get("text_quotes") or {},
+            "text_quotes": text_quotes,
+            "llm_hits": llm_hits, "llm_quotes": llm_quotes,
             "model": cfg.get("llm.model", "claude-opus-5"),
             "disclaimer": DISCLAIMER}

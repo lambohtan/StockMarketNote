@@ -33,7 +33,22 @@ OUTPUT_SCHEMA = {
     "required": ["summary"],
     "additionalProperties": False,
 }
+
+# 深读长文（stage2 的四段叙述）的输出形状。摘要那张 schema 装不下它：
+# `summary` 这个 key 与 SYSTEM 的「两句话以内」是一整套约定，长文走自己的 key。
+LONG_TEXT_SCHEMA = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+    "additionalProperties": False,
+}
+
 _NUMBER_TOKEN = re.compile(r"(?<!\d)\d[\d,]*(?:\.\d+)?")
+
+# 「带财务量级单位的数字」——深读长文的数字口径只管这一类（见
+# _validate_numeric_magnitude 的 docstring）。
+_MAGNITUDE_UNIT = re.compile(
+    r"\s*(%|％|个百分点|百分点|个点|pt(?![a-zA-Z])|倍|万亿|亿|万|美元|美金|元)")
 
 
 class LLMConfigError(Exception):
@@ -166,19 +181,91 @@ def _validate_numeric_provenance(summary, material):
             raise ValueError("摘要数字未通过来源校验")
 
 
-def build_cli_cmd(cfg, instruction):
-    """拼 claude -p 的命令行。单独抽出来是为了能测。"""
+def _render_variants(value):
+    """一个数值在中文叙述里可能被写成的几种字面形式（0/1/2/3 位小数，去尾零）。"""
+    out = set()
+    for nd in (0, 1, 2, 3):
+        s = f"{value:.{nd}f}"
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        out.add(s.lstrip("-") or "0")
+    return out
+
+
+def _traceable_numbers(material):
+    """材料里出现过的数值，连同它的百分比换算与常见小数位写法。
+
+    材料是 facts 的 JSON dump（`0.94`），模型把它写成中文叙述时会写
+    「94%」——这是同一个数字的另一种合法写法，不是新造的数字。所以来源集合
+    必须把 ×100 / ÷100 与四种小数位写法一起展开，否则合法引用会被判成幻觉。
+    """
+    vals = set()
+    for m in _NUMBER_TOKEN.finditer(material or ""):
+        raw = m.group(0).replace(",", "")
+        vals.add(raw)
+        try:
+            v = float(raw)
+        except ValueError:
+            continue
+        for candidate in (v, v * 100.0, v / 100.0):
+            vals.update(_render_variants(candidate))
+    return vals
+
+
+def _validate_numeric_magnitude(text, material):
+    """深读长文的数字口径：只拦「材料里找不到的财务量级数字」。
+
+    为什么不沿用 `_validate_numeric_provenance`（每个数字 token 都必须
+    在材料里逐字出现）：那条规则是为「两句话以内的摘要」设计的，用在四段
+    中文叙述上会把大量合法表述判成幻觉 —— 材料里是 `0.94`，模型写
+    「同比增长 94%」；「命中 6/8」「三条待观察」「① ② ③」这类计数和序号
+    在材料里根本不会逐字出现。而它的失败模式是**丢弃整段**：报告里只剩
+    一句「LLM 深读失败」，看上去像是诚实的降级，实际上是校验器把好输出
+    扔了 —— 这正是 P4 最终审查判为 Critical 的那类静默失败。
+
+    这里改成：只有**带财务量级单位**（%、个百分点、倍、万/亿/万亿、美元）
+    且在材料里找不到对应数值的数字才拒绝。理由是这类数字才是读者会当成
+    财务事实读的东西；裸的小整数（条数、序号、名次、比分）不是数值结论，
+    而且报告里所有**参与计分和展示的数字**（X/Y、六条判定明细、PE）全部
+    由 render.py 从 py 的结果直接渲染，不经过这段叙述 —— 硬约束 2
+    「LLM 不产任何数字」在计分链路上由 C2 的白名单保证，不靠这条校验。
+    """
+    allowed = _traceable_numbers(material)
+    for m in _NUMBER_TOKEN.finditer(text or ""):
+        if not _MAGNITUDE_UNIT.match(text[m.end():m.end() + 6]):
+            continue
+        raw = m.group(0).replace(",", "")
+        if raw in allowed:
+            continue
+        try:
+            if _render_variants(float(raw)) & allowed:
+                continue
+        except ValueError:
+            pass
+        raise ValueError("深读叙述里出现了材料中没有的量级数字")
+
+
+def _cli_cmd(cfg, instruction, schema):
+    """拼 claude -p 的命令行。schema 由调用方给 —— 输出形状不是一套。"""
     claude_bin = cfg.get("llm.claude_bin") or DEFAULT_CLAUDE_BIN
     return [
         claude_bin, "-p",
         "--append-system-prompt", instruction,
         "--output-format", "json",
-        "--json-schema", json.dumps(OUTPUT_SCHEMA, ensure_ascii=False,
-                                     separators=(",", ":")),
+        "--json-schema", json.dumps(schema, ensure_ascii=False,
+                                    separators=(",", ":")),
         # ⚠️ 不要加 --bare：它不读订阅登录
         # ⚠️ 不给任何工具权限：纯文本进，纯文本出
         "--permission-mode", "dontAsk",
     ]
+
+
+def build_cli_cmd(cfg, instruction):
+    """拼摘要路径（summarize）的命令行。单独抽出来是为了能测。
+
+    schema 固定是 OUTPUT_SCHEMA —— 这条路是日报（P3）在走的，形状不动。
+    """
+    return _cli_cmd(cfg, instruction, OUTPUT_SCHEMA)
 
 
 SYSTEM = (
@@ -274,3 +361,168 @@ def summarize(cfg, material, instruction=None, dry_run=False, timeout=120, store
         _runtime_fail(store, "api_parse")
         return ""
     return _guard_or_log(result, store)
+
+
+# ---------------------------------------------------------------------------
+# 深读（P4）专用入口。
+#
+# 为什么不复用 summarize()：summarize() 的三条约定是**为日报摘要绑在一起**的
+#   ① 无条件把 SYSTEM 拼在 instruction 前面，而 SYSTEM 第 5 条是「两句话以内」
+#   ② CLI 的 --json-schema 固定为 {"summary": string} 且 additionalProperties
+#      为 false，_extract_summary 只把 summary 字符串交回调用方
+#   ③ 数字溯源要求输出里每个数字 token 都在材料里逐字出现
+# 深读 stage1 要的是一个含 8 条判定 + 引用的 JSON 对象（②直接让它不可能回来），
+# stage2 要的是四段带固定标题的中文（①把它砍成两句、③把整段丢掉）。
+#
+# 所以这里新增两个入口，**summarize() 的 SYSTEM / schema / 数字溯源一字不动**，
+# 日报链路（P3）完全不受影响。两个入口沿用同一套语义：
+#   - check_env 的 LLMConfigError 照旧冒泡，配置错误必须响亮失败
+#   - 运行时失败记 llm.runtime 并返回空，调用方降级
+#   - 输出仍然过 _guard_or_log 的指令性措辞守卫
+# ---------------------------------------------------------------------------
+
+
+def _coerce_object(value):
+    """把 CLI/API 的结构化结果归一成 dict（不抽 summary —— 深读要整个对象）。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError("结构化输出为空")
+        parsed = json.loads(raw)      # JSONDecodeError 是 ValueError 的子类
+        if not isinstance(parsed, dict):
+            raise ValueError("结构化输出不是对象")
+        return parsed
+    raise ValueError("结构化输出类型不正确")
+
+
+def _parse_cli_structured(raw):
+    """CLI 外层 JSON → 结构化对象。与 _parse_cli_output 的差别只在不抽 summary。"""
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("CLI 外层输出不是对象")
+    candidate = data.get("structured_output")
+    if candidate is None:
+        candidate = data.get("structuredOutput")
+    if candidate is None:
+        candidate = data.get("result")
+    return _coerce_object(candidate)
+
+
+def _raw_completion(cfg, material, instruction, schema, timeout, store):
+    """跑一次 LLM，返回结构化输出对象；运行时失败返回 None（已记 source_health）。
+
+    ``instruction`` **原样**当系统提示，不拼 SYSTEM —— 深读的两个 instruction
+    自带完整要求（输出形状、判定口径、不给买卖建议），再叠一层「两句话以内」
+    只会自相矛盾。
+    """
+    check_env(cfg)   # LLMConfigError 不在这里捕获，直接冒泡
+
+    provider = cfg.get("llm.provider", "claude_cli")
+
+    if provider == "claude_cli":
+        LLM_WORKDIR.mkdir(parents=True, exist_ok=True)
+        cmd = _cli_cmd(cfg, instruction, schema)
+        try:
+            p = subprocess.run(cmd, input=material, capture_output=True,
+                               text=True, timeout=timeout, cwd=str(LLM_WORKDIR))
+            if p.returncode != 0:
+                _runtime_fail(store, "cli_nonzero")
+                return None
+            return _parse_cli_structured(p.stdout)
+        except subprocess.TimeoutExpired:
+            _runtime_fail(store, "cli_timeout")
+            return None
+        except (json.JSONDecodeError, ValueError):
+            _runtime_fail(store, "cli_parse")
+            return None
+        except Exception:
+            _runtime_fail(store, "cli_exception")
+            return None
+
+    # provider == "api"
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model=cfg.get("llm.model", "claude-opus-5"),
+            max_tokens=int(cfg.get("llm.max_tokens", 2000)),
+            system=instruction,
+            messages=[{"role": "user", "content": material}],
+        )
+        text = "".join(b.text for b in resp.content
+                       if getattr(b, "type", "") == "text").strip()
+    except Exception:
+        _runtime_fail(store, "api_exception")
+        return None
+    try:
+        return _coerce_object(text)
+    except ValueError:
+        _runtime_fail(store, "api_parse")
+        return None
+
+
+def _string_values(obj):
+    """结构化输出里所有字符串叶子值 —— 守卫要看的正是这些会进报告的文本。"""
+    out = []
+
+    def walk(v):
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(obj)
+    return "\n".join(out)
+
+
+def complete_json(cfg, material, instruction, schema, dry_run=False,
+                  timeout=180, store=None):
+    """结构化输出入口（深读 stage1）。返回 **JSON 字符串**，失败返回空串。
+
+    返回字符串而不是 dict，是为了让调用方的解析路径只有一条：stage1 本来
+    就要处理「模型返回垃圾」的情况，多一条 dict 分支只会多一处未测代码。
+
+    这里**不做数字溯源**：stage1 的输出是布尔判定加财报原文引用，引用本身
+    就是从材料里抄的文本，对它做 token 级溯源只会因为截断/换行把整份判定
+    丢掉，而这些判定里没有任何数字会进报告的数值链路（计分只认白名单里的
+    两条布尔，见 deepread._clean_text_hits）。
+    """
+    if dry_run:
+        return ""
+    obj = _raw_completion(cfg, material, instruction, schema, timeout, store)
+    if obj is None:
+        return ""
+    payload = _string_values(obj)
+    if payload and _guard_or_log(payload, store) == "":
+        return ""     # 引用里出现指令性措辞：整份判定作废，且已记 llm.guard
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def complete_text(cfg, material, instruction, dry_run=False, timeout=180,
+                  store=None):
+    """长文输出入口（深读 stage2 的四段叙述）。失败返回空串。"""
+    if dry_run:
+        return f"[dry-run] 将把 {len(material)} 字材料交给 LLM 深读"
+    obj = _raw_completion(cfg, material, instruction, LONG_TEXT_SCHEMA,
+                          timeout, store)
+    if obj is None:
+        return ""
+    text = obj.get("text")
+    if not isinstance(text, str):
+        # 兼容：模型偶尔会沿用摘要那张 schema 的 key。
+        text = obj.get("summary")
+    if not isinstance(text, str) or not text.strip():
+        _runtime_fail(store, "empty_text")
+        return ""
+    text = text.strip()
+    try:
+        _validate_numeric_magnitude(text, material)
+    except ValueError as e:
+        return _guard_or_log(text, store, guard_error=str(e))
+    return _guard_or_log(text, store)

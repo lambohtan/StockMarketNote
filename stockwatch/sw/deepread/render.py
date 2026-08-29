@@ -31,17 +31,31 @@ def _clip(text, limit=MAX_PUSH_BYTES):
 
 
 def _hit_lines(item):
-    """把 py 六条与 LLM 两条摊开成人话。"""
+    """把 py 六条与 LLM 两条摊开成人话。
+
+    LLM 那两条走 `TEXT_CRITERIA` 白名单 + 严格布尔（与 `deepread.stage2` 的
+    计分口径同源）：模型自造的 key 不进渲染，字符串 `"false"` 不算命中。
+    否则报告里会出现连标签都没有的条目，而它已经把分母顶高了。
+    """
     py = item["py"]
     labels = {c["key"]: c["label"] for c in CRITERIA}
     hit, miss, unknown = [], [], []
     for key, value in py["hits"].items():
         text = f"{labels.get(key, key)}（{py['details'].get(key, '')}）"
+        # 三态路由：True → 命中，False → 未命中，None → 数据缺失。
+        # ⚠️ 不能简化成 `not value`：那会把 None（数据缺失）并进「未命中」，
+        # 正是 spec §6 明令禁止的「把取不到数伪装成不符合」。
         (hit if value else miss if value is False else unknown).append(text)
-    text_labels = {c["key"]: c["label"] for c in TEXT_CRITERIA}
-    for key, value in (item.get("text_hits") or {}).items():
+    raw_text_hits = item.get("text_hits") or {}
+    for c in TEXT_CRITERIA:
+        key = c["key"]
+        if key not in raw_text_hits:
+            continue
+        value = raw_text_hits[key]
+        if value is not True and value is not False:
+            value = None          # 非布尔一律当「未判定」，不当命中
         quote = (item.get("text_quotes") or {}).get(key, "")
-        text = text_labels.get(key, key) + (f"（原文：{quote[:80]}）" if quote else "")
+        text = c["label"] + (f"（原文：{quote[:80]}）" if quote else "")
         (hit if value else miss if value is False else unknown).append(text)
     return hit, miss, unknown
 
@@ -70,9 +84,14 @@ def render_report(d, items):
         if rank is not None:
             L.append(f"社区热度：当前第 {rank} 名"
                      + (f"，24h 前第 {prev} 名（{delta:+d}）" if delta is not None else ""))
-        pe, fpe = facts.get("pe"), facts.get("forward_pe")
-        if pe is not None or fpe is not None:
-            L.append(f"当前 PE {pe} / forward PE {fpe}（原始数字，不参与判定）")
+        # 只印取到的那个：两个都拼在一行时，缺失的一侧会字面打出 "None"。
+        pe_parts = []
+        if facts.get("pe") is not None:
+            pe_parts.append(f"当前 PE {facts['pe']}")
+        if facts.get("forward_pe") is not None:
+            pe_parts.append(f"forward PE {facts['forward_pe']}")
+        if pe_parts:
+            L.append(" / ".join(pe_parts) + "（原始数字，不参与判定）")
         L.append("")
         for dis in item.get("disagreements") or []:
             L += [f"⚠️ py 与 LLM 分歧：{dis['label']}",
