@@ -65,15 +65,28 @@ def _guard_or_log(text, store):
     违规摘要"这件事可见。如果没有 store（比如调用方还没接入，或测试环境），
     退化为打印到 stderr——launchd 会把 stderr 写进 StandardErrorPath，
     不会真的消失。
+
+    Task 7 修复轮 2：观测性代码绝不能自己成为新的失败点。上一轮加的
+    store.log_health(...) 调用没包 try/except——sqlite3 撞锁、磁盘满、
+    连接已关闭都会让它抛异常，而这里正好处在两处 summarize() 的
+    try/except Exception **之外**，异常会直接冒泡把整条调用链崩掉。
+    最坏的时机恰好是"LLM 持续产出违规摘要、最需要记录"的时候：如果这时候
+    store 写入撞锁，"记录违规"这个动作反而会让当天的日报流水线整个崩掉——
+    比修复前"静默吞掉、只是运维看不到信号"更糟。所以 log_health 本身也要
+    当成一次可能失败的 I/O 来对待，失败就退化到 stderr，跟没有 store 时
+    走同一条路，不能让"记日志"这件事本身有能力弄崩调用方。
     """
     try:
         return _guard(text)
     except ValueError as e:
         detail = f"{e}｜摘要前100字：{text[:100]!r}"
         if store is not None:
-            store.log_health("llm.guard", False, 0, detail)
-        else:
-            print(f"[llm.guard] 守卫拦下 LLM 输出：{detail}", file=sys.stderr)
+            try:
+                store.log_health("llm.guard", False, 0, detail)
+                return ""
+            except Exception:
+                pass  # store 本身出故障，退化到 stderr，不能让记日志这件事把调用链崩掉
+        print(f"[llm.guard] 守卫拦下 LLM 输出：{detail}", file=sys.stderr)
         return ""
 
 

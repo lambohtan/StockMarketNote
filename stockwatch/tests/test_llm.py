@@ -6,7 +6,7 @@
 最重要的一条：provider=claude_cli 时环境里若存在 ANTHROPIC_API_KEY，
 Claude Code 会**静默改用 API 计费**而不是订阅。必须启动时就报错退出。
 """
-import sys, os
+import sys, os, io, contextlib
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sw import llm as LM
@@ -184,6 +184,91 @@ def test_guard_violation_is_logged():
     check("没有记 source_health", len(store2.calls), 0)
 
 
+class BrokenStore:
+    """测试用坏 store：log_health 本身会抛异常，模拟 sqlite3 撞锁/磁盘满/
+    连接已关闭。这些都是真实会发生的 store 故障，不是凭空假设。"""
+    def log_health(self, *a, **kw):
+        raise RuntimeError("模拟 store 已关闭 / 磁盘故障")
+
+
+def test_guard_or_log_survives_broken_store():
+    """
+    Task 7 修复轮 2 · Important 1：store.log_health(...) 之前没有任何
+    try/except，而 summarize() 里两处调用 _guard_or_log 的地方都在各自的
+    try/except Exception **之外**——store 写入失败（sqlite3 撞锁、磁盘满、
+    连接已关闭）会直接冒泡，违反 docstring 明确承诺的"绝不中断整个任务"。
+
+    最坏的时机恰好是"LLM 持续产出违规摘要、正需要记日志"的时候：这时候
+    如果 store 写入撞锁，"记录违规"这个动作反而会让当天的日报流水线整个
+    崩掉——比修复前"静默吞掉、只是运维看不到信号"更糟。
+
+    修法：log_health 本身也当成一次可能失败的 I/O，失败就退化到 stderr，
+    跟没有 store 时走同一条路。这条测试确认这个退化真的发生、真的不崩。
+    """
+    print("\n观测性代码本身不能成为新的失败点：store.log_health 抛异常也不能崩")
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        out = LM._guard_or_log("建议卖出该持仓", BrokenStore())
+    check("store 故障时仍返回空字符串（不崩）", out, "")
+    stderr_text = buf.getvalue()
+    check("store 故障退化到 stderr 里有 llm.guard 标记", "llm.guard" in stderr_text, True)
+    check("stderr 里带着被拦短语", "建议卖出" in stderr_text, True)
+
+
+def test_summarize_survives_broken_store_end_to_end():
+    """
+    同一个问题在 summarize() 层面的端到端复现——只测 _guard_or_log() 内部
+    测不出"summarize() 本身还会不会被这层异常波及"，因为 bug 恰恰在于
+    summarize() 里调用 _guard_or_log() 的两处（claude_cli 分支、api 分支）
+    都在各自的 try/except Exception 之外。
+
+    这里 monkeypatch 假的 subprocess.run（不真调 LLM，符合任务约束），逼
+    summarize() 走到 claude_cli 分支的守卫触发路径，配上 BrokenStore，
+    断言 summarize() 整体依然乖乖返回空字符串，而不是把异常甩给调用方。
+    """
+    print("\nsummarize() 端到端：store 故障不能让整条调用链崩溃")
+
+    class FakeCompleted:
+        def __init__(self, returncode, stdout):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, input=None, capture_output=None, text=None, timeout=None, cwd=None):
+        import json as _json
+        return FakeCompleted(0, _json.dumps({"result": "建议卖出该持仓"}))
+
+    old_run = LM.subprocess.run
+    LM.subprocess.run = fake_run
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            out = LM.summarize(Cfg("claude_cli"), "材料若干", "压成一句话",
+                                store=BrokenStore())
+        check("summarize() 在 store 故障时仍返回空字符串（不崩）", out, "")
+        check("summarize() 端到端也退化到了 stderr", "llm.guard" in buf.getvalue(), True)
+    finally:
+        LM.subprocess.run = old_run
+
+
+def test_stderr_fallback_has_content():
+    """
+    Task 7 修复轮 2 · Important 2：复审的变异把 `else: print(..., file=
+    sys.stderr)` 改成 `else: pass`，测试全绿——因为此前的测试只断言了
+    返回值是空字符串，从没真正捕获过 stderr 里到底有没有内容。这里用
+    redirect_stderr 真的抓一次输出，确认没有 store 时的退化路径真的打印
+    了东西（而且打印到的确实是 stderr，不是 stdout），不能是空动作。
+    """
+    print("\n无 store 时 stderr 兜底路径必须真的有输出，不能是空动作")
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        out = LM._guard_or_log("建议买入 NVDA", None)
+    check("无 store 时仍返回空字符串", out, "")
+    stderr_text = buf.getvalue()
+    check("stderr 里有 llm.guard 标记", "llm.guard" in stderr_text, True)
+    check("stderr 里带着被拦短语", "建议买入" in stderr_text, True)
+
+
 if __name__ == "__main__":
     test_api_key_conflict_is_fatal()
     test_api_mode_without_key_is_fatal()
@@ -193,6 +278,9 @@ if __name__ == "__main__":
     test_output_passes_directive_guard()
     test_cross_sentence_attack_on_guard()
     test_guard_violation_is_logged()
+    test_guard_or_log_survives_broken_store()
+    test_summarize_survives_broken_store_end_to_end()
+    test_stderr_fallback_has_content()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
