@@ -200,6 +200,28 @@ def test_push_money_survives_truncation_boundary():
     assert_no_money(body)
 
 
+def test_push_replaces_money_from_watchlist_events_instead_of_raising():
+    """
+    Task 8 修复轮 3：复审自选变异发现的不对称——同一个 render_push 里，
+    causes 来的 reason 遇到金额会静默替换，watchlist_events 遇到金额却
+    依旧硬抛 ValueError，导致整条推送渲染失败、当天日报全丢。协调者裁定
+    统一成「替换」：推送是产品本体，为一个金额把当天报告整个弄没，代价
+    远大于显示一个占位符。
+
+    这里构造一条含金额的 watchlist_events，验证 render_push 不抛异常，
+    body 里含占位符、不含原始金额数字。
+    """
+    print("\nwatchlist_events 里的金额也要被替换，而不是让整条推送渲染失败")
+    ctx = make_ctx()
+    ctx["watchlist_events"] = ["MNOP 获 3 家基金新建仓，合计 5000 万美元"]
+    title, body = DR.render_push(ctx)
+    check("watchlist 的裸金额没有原样出现在推送正文里", "5000 万美元" in body, False)
+    check("金额被替换成了占位符", "[金额见面板]" in body, True)
+    check("MNOP 仍然出现（不是把整条事件删掉，只是替换金额）", "MNOP" in body, True)
+    # 最终防线复核：即使占位符逻辑有问题，assert_no_money 也不能放过。
+    assert_no_money(body)
+
+
 if __name__ == "__main__":
     test_quiet_holdings_are_absent()
     test_push_has_no_money_and_no_directives()
@@ -207,6 +229,7 @@ if __name__ == "__main__":
     test_markdown_blocks_directive_leaking_from_causes()
     test_push_blocks_directive_leaking_from_causes()
     test_no_attributions_is_reported_as_missing_data()
+    test_push_replaces_money_from_watchlist_events_instead_of_raising()
     test_push_money_survives_truncation_boundary()
     test_decomposition_shown()
     test_empty_day_is_still_valid()

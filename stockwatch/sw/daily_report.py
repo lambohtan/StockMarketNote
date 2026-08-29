@@ -94,6 +94,14 @@ def render_push(ctx):
     alerts.render_alert_push() 单独入队为独立通知（priority=urgent），
     见设计文档 §7「每条 L1 单独一条通知」。日报正文只放异动摘要，不重复
     L1 的内容。
+
+    ⚠️ 修复轮 3：金额一律先替换成占位符再进正文，而不是抛异常 ——
+    推送是本系统的产品本体，为一个金额丢掉当天整份日报，代价远大于
+    显示占位符。ctx 里凡是外部/LLM 生成、长度不受控的文本字段
+    （causes 的 reason、watchlist_events 的每一条）都在拼进正文前先过
+    MONEY_RE.sub 替换（有截断的话，替换必须在截断之前，见修复轮 2）。
+    assert_no_money(body) 保留作最终防线，拦替换没覆盖到的写法，
+    两者不冲突：替换是第一道，兜底是最后一道。
     """
     movers = _movers(ctx)
     total = len(ctx["attributions"])
@@ -128,7 +136,9 @@ def render_push(ctx):
         L.append("")
         L.append("观察池")
         for e in ctx["watchlist_events"][:3]:
-            L.append(f"  {e}")
+            # 同 reason 字段的处理：先替换金额再拼正文，不对 watchlist
+            # 事件里出现的金额抛异常——见上方 docstring 的策略说明。
+            L.append(f"  {MONEY_RE.sub('[金额见面板]', e)}")
 
     body = "\n".join(L)
     assert_no_money(body)
