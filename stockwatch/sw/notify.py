@@ -98,7 +98,8 @@ def send(cfg, title, body, priority="default", tags=None, dry_run=False):
     assert_no_money(body)
     assert_no_money(title)
     if dry_run:
-        print(f"[dry-run] → {url}\n  [{priority}] {title}\n  {body[:300]}")
+        # 干跑只展示内容，不把配置里的 topic（等同于密码）打印到日志。
+        print(f"[dry-run] → ntfy endpoint\n  [{priority}] {title}\n  {body[:300]}")
         return True, "dry-run"
     try:
         headers = {
@@ -120,6 +121,9 @@ def drain(store, cfg, dry_run=False, today=None):
     """
     把队列里所有未发送的条目发出去。
 
+    dry_run=True 是严格只读的预览：会读取队列并调用 send(..., dry_run=True)
+    展示内容，但绝不入队、claim、release、记失败或写健康记录。
+
     发送前先做失败检测：今天如果**从来没有**入队过 daily 条目，
     说明计算任务没跑成（可能是硬崩溃，try/except 抓不到），
     入队一条 failure 通知。用户不会每天开 app，
@@ -134,6 +138,7 @@ def drain(store, cfg, dry_run=False, today=None):
     """
     today = today or et_today().isoformat()
     failure_reported = False
+    failure_preview = None
 
     if (not OB.has_kind_on(store, "daily", today)
             and not OB.has_kind_on(store, "failure", today)):
@@ -143,18 +148,44 @@ def drain(store, cfg, dry_run=False, today=None):
         last = store.q("SELECT substr(created_at,1,10) d FROM outbox "
                        "WHERE kind='daily' ORDER BY created_at DESC LIMIT 1")
         last_ok = last[0]["d"] if last else "从未成功过"
-        # created_at 的日期部分锚定到 today（而不是 datetime.now()），
-        # 否则 has_kind_on(store, "failure", today) 在「今天」是调用方注入的
-        # 逻辑日期（测试、或补跑时的美股交易日）而非真实挂钟日期时会找不到
-        # 刚入队的这条，导致「同一天不重复上报」失效。
-        created_at = today + datetime.now().strftime("T%H:%M:%S")
-        OB.enqueue(store, "failure",
-                   f"StockWatch {today} 没跑成",
-                   f"今天的计算任务没有产出日报。\n"
-                   f"最后一次成功：{last_ok}\n"
-                   f"排查：查看 logs/ 目录，或在菜单栏里点「立即运行一次」。",
-                   priority="high", created_at=created_at)
+        failure_preview = {
+            "kind": "failure",
+            "priority": "high",
+            "title": f"StockWatch {today} 没跑成",
+            "body": f"今天的计算任务没有产出日报。\n"
+                    f"最后一次成功：{last_ok}\n"
+                    f"排查：查看 logs/ 目录，或在菜单栏里点「立即运行一次」。",
+        }
+        if not dry_run:
+            # created_at 的日期部分锚定到 today（而不是 datetime.now()），
+            # 否则 has_kind_on(store, "failure", today) 在「今天」是调用方注入的
+            # 逻辑日期（测试、或补跑时的美股交易日）而非真实挂钟日期时会找不到
+            # 刚入队的这条，导致「同一天不重复上报」失效。
+            created_at = today + datetime.now().strftime("T%H:%M:%S")
+            OB.enqueue(store, "failure", failure_preview["title"],
+                       failure_preview["body"], priority="high",
+                       created_at=created_at)
         failure_reported = True
+
+    if dry_run:
+        # 预览 failure（正式模式下它会先入队）和现有未发送条目，但不使用
+        # claim/release，也不写 attempts、last_error 或 source_health。
+        rows = ([failure_preview] if failure_preview else []) + OB.unsent(store)
+        sent = failed = 0
+        for row in rows:
+            try:
+                ok, detail = send(cfg, row["title"], row["body"],
+                                  priority=row["priority"] or "default",
+                                  tags=TAGS.get(row["kind"]), dry_run=True)
+            except ValueError as e:
+                # 金额守卫命中：干跑也要报告失败，但不能把错误写回数据库。
+                ok, detail = False, str(e)
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+        return {"sent": sent, "failed": failed,
+                "failure_reported": failure_reported}
 
     sent = failed = 0
     for row in OB.unsent(store):

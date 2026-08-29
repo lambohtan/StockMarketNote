@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """推送与 drain 的测试。运行：python3 tests/test_notify.py
 
-⚠️ 全部用 dry_run，绝不真发。
+⚠️ 正常 drain 状态机使用 fake send，绝不联网；另有专门的 dry-run 只读测试。
 
 四个重点：
   1. 金额守卫 —— ntfy.sh 是公共服务器，正文里不能出现账户金额
@@ -11,6 +11,8 @@
      可能同时 drain，drain 必须用 claim/release 原语，绝不能对同一条
      已被领走的条目重复发送
 """
+import contextlib
+import io
 import sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -44,6 +46,23 @@ class FakeCfg:
     ntfy_topic = "test-topic"
     def get(self, k, d=None):
         return d
+
+
+def fake_send(cfg, title, body, priority="default", tags=None, dry_run=False):
+    """不联网的发送替身，同时保留金额守卫行为。"""
+    NT.assert_no_money(title)
+    NT.assert_no_money(body)
+    return True, "fake-send"
+
+
+def drain_with_fake_send(store, cfg, **kwargs):
+    """在正式模式下运行 drain，覆盖 claim/release 和状态写入。"""
+    real_send = NT.send
+    NT.send = fake_send
+    try:
+        return NT.drain(store, cfg, dry_run=False, **kwargs)
+    finally:
+        NT.send = real_send
 
 
 def fresh_store():
@@ -142,11 +161,11 @@ def test_drain_sends_and_marks():
     print("\ndrain 发送并标记（claim/release 流程）")
     st, cfg = fresh_store(), FakeCfg()
     OB.enqueue(st, "daily", "标题", "正文 -8.7%", created_at="2026-08-27T06:05:00")
-    r = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    r = drain_with_fake_send(st, cfg, today="2026-08-27")
     check("发出 1 条", r["sent"], 1)
     check("队列清空", OB.unsent(st), [])
     # 再 drain 一次不能重发（claim 已经写了 sent_at）
-    r2 = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    r2 = drain_with_fake_send(st, cfg, today="2026-08-27")
     check("重复 drain 不重发", r2["sent"], 0)
     st.close()
 
@@ -154,13 +173,13 @@ def test_drain_sends_and_marks():
 def test_failure_reported_when_no_daily():
     print("\n失败检测：今天没有 daily 条目就要上报")
     st, cfg = fresh_store(), FakeCfg()
-    r = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    r = drain_with_fake_send(st, cfg, today="2026-08-27")
     check("上报了失败", r["failure_reported"], True)
     check("失败通知被发出", r["sent"], 1)
     kinds = [x["kind"] for x in st.q("SELECT kind FROM outbox")]
     check("入队的是 failure", kinds, ["failure"])
     # 同一天再 drain 不能重复上报
-    r2 = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    r2 = drain_with_fake_send(st, cfg, today="2026-08-27")
     check("同一天不重复上报", r2["failure_reported"], False)
     st.close()
 
@@ -169,10 +188,10 @@ def test_no_false_failure_when_daily_exists():
     print("\n补跑竞态：有 daily 条目时绝不误报失败")
     st, cfg = fresh_store(), FakeCfg()
     OB.enqueue(st, "daily", "T", "B -1.2%", created_at="2026-08-27T06:05:00")
-    r = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    r = drain_with_fake_send(st, cfg, today="2026-08-27")
     check("没有误报", r["failure_reported"], False)
     # 已发送过的 daily 也不该触发失败上报
-    r2 = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    r2 = drain_with_fake_send(st, cfg, today="2026-08-27")
     check("已发送后仍不误报", r2["failure_reported"], False)
     st.close()
 
@@ -182,7 +201,7 @@ def test_money_in_queue_is_rejected_not_sent():
     st, cfg = fresh_store(), FakeCfg()
     OB.enqueue(st, "daily", "T", "你的持仓市值 $9,130",
                created_at="2026-08-27T06:05:00")
-    r = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    r = drain_with_fake_send(st, cfg, today="2026-08-27")
     check("没有发出", r["sent"], 0)
     check("计为失败", r["failed"], 1)
     rows = OB.unsent(st)
@@ -208,12 +227,49 @@ def test_claimed_entry_is_skipped():
     real_unsent = OB.unsent
     NT.OB.unsent = lambda store: stale_snapshot
     try:
-        r = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+        r = drain_with_fake_send(st, cfg, today="2026-08-27")
     finally:
         NT.OB.unsent = real_unsent
 
     check("没有重复发送", r["sent"], 0)
     check("也没有误计为失败", r["failed"], 0)
+    st.close()
+
+
+def test_dry_run_is_read_only_and_previews():
+    print("\ndry-run 只读：预览不改变 outbox 或 health")
+    st, cfg = fresh_store(), FakeCfg()
+
+    # 空库仍应发现计算失败并预览 failure，但前后数据库完全不变。
+    before_outbox = st.q("SELECT * FROM outbox ORDER BY id")
+    before_health = st.q("SELECT * FROM source_health ORDER BY rowid")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    check("空库仍报告 failure", r["failure_reported"], True)
+    check("空库 failure 预览计数", r["sent"], 1)
+    check("空库预览可见", "[dry-run]" in buf.getvalue(), True)
+    check("空库预览不输出 endpoint/topic", cfg.ntfy_url in buf.getvalue(), False)
+    check("空库 outbox 完全不变", st.q("SELECT * FROM outbox ORDER BY id"),
+          before_outbox)
+    check("空库 health 完全不变", st.q("SELECT * FROM source_health ORDER BY rowid"),
+          before_health)
+
+    # 已有条目也必须只读，尤其不能 claim 写 sent_at。
+    OB.enqueue(st, "daily", "标题", "正文 -1.2%", created_at="2026-08-27T06:05:00")
+    before_outbox = st.q("SELECT * FROM outbox ORDER BY id")
+    before_health = st.q("SELECT * FROM source_health ORDER BY rowid")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r = NT.drain(st, cfg, dry_run=True, today="2026-08-27")
+    check("已有 daily 不误报 failure", r["failure_reported"], False)
+    check("已有条目预览计数", r["sent"], 1)
+    check("已有条目预览可见", "[dry-run]" in buf.getvalue(), True)
+    check("已有条目预览不输出 endpoint/topic", cfg.ntfy_url in buf.getvalue(), False)
+    check("已有条目 outbox 完全不变", st.q("SELECT * FROM outbox ORDER BY id"),
+          before_outbox)
+    check("已有条目 health 完全不变", st.q("SELECT * FROM source_health ORDER BY rowid"),
+          before_health)
     st.close()
 
 
@@ -226,6 +282,7 @@ if __name__ == "__main__":
     test_no_false_failure_when_daily_exists()
     test_money_in_queue_is_rejected_not_sent()
     test_claimed_entry_is_skipped()
+    test_dry_run_is_read_only_and_previews()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
