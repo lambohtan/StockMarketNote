@@ -63,6 +63,44 @@ def test_money_guard():
     print("  ✅ 百分比与 σ 值正常放行")
 
 
+def test_money_guard_wider_wordings():
+    """
+    Task 8 修复轮 1：复审实测「50万元人民币」「50万港元」「1234usd」
+    未被原来四条覆盖 —— LLM 摘要的措辞空间比 brief 举的例子宽得多。
+    这里把「必须拦」和「必须放行」两组都断言上，防止以后改正则时
+    只顾一边。
+    """
+    print("\n金额守卫：更宽的中文币种 + 大小写不敏感的 ISO 代码")
+    # 必须拦下：新增的三种写法 + brief 里原本就该拦的写法
+    check_raises("人民币口语写法被拦下", lambda: NT.assert_no_money("成本约 50万元人民币"))
+    check_raises("港元被拦下", lambda: NT.assert_no_money("浮盈 50万港元"))
+    check_raises("贴数字的小写 usd 被拦下", lambda: NT.assert_no_money("市值 1234usd"))
+    check_raises("日元被拦下", lambda: NT.assert_no_money("等值 300万日元"))
+    check_raises("欧元被拦下", lambda: NT.assert_no_money("等值 2000欧元"))
+    check_raises("英镑被拦下", lambda: NT.assert_no_money("等值 1500英镑"))
+    # 「千万」量词必须跟在阿拉伯数字后面（"3千万美元"），跟在中文数字后面
+    # （"两千万美元"）是另一个量级的问题——完整中文数字解析（一/二/三/…/
+    # 十/百/千/万/亿及其组合）不在本轮修复范围内，brief 只要求
+    # 「万/亿/千万 与上述币种的组合」，指的是数字 + 量词的搭配。
+    check_raises("千万量词被拦下", lambda: NT.assert_no_money("市值 3千万美元"))
+    check_raises("RMB 代码被拦下", lambda: NT.assert_no_money("成本 RMB 5000"))
+    check_raises("CNY 后缀小写被拦下", lambda: NT.assert_no_money("金额 5000cny"))
+    check_raises("HKD 前缀被拦下", lambda: NT.assert_no_money("市值 HKD 2000"))
+
+    # 必须放行：推送正文的主要内容，不能被新正则误伤
+    for text in [
+        "NVDA -8.7%，个股独立 -9.1%（2.4σ）",
+        "市盈率 24.5",
+        "过去 60 日走势偏弱",
+        "2026 年财报季",
+        "讨论量排名第 3 名",
+        "3 家基金本季新建仓",
+        "2.4σ",
+    ]:
+        NT.assert_no_money(text)
+    print("  ✅ 百分比 / σ 值 / 市盈率 / 天数 / 年份 / 排名 / 家数 正常放行")
+
+
 def test_drain_sends_and_marks():
     print("\ndrain 发送并标记（claim/release 流程）")
     st, cfg = fresh_store(), FakeCfg()
@@ -144,6 +182,7 @@ def test_claimed_entry_is_skipped():
 
 if __name__ == "__main__":
     test_money_guard()
+    test_money_guard_wider_wordings()
     test_drain_sends_and_marks()
     test_failure_reported_when_no_daily()
     test_no_false_failure_when_daily_exists()
