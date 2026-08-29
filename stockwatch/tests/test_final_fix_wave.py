@@ -666,7 +666,7 @@ def test_policy_final_send_and_schedule():
             finally:
                 SC.subprocess.run = old_run
             check("bootstrap 失败不进 done", done, [])
-            check("失败尝试四项 bootstrap", sum(x[1] == "bootstrap" for x in calls), 4)
+            check("失败尝试五项 bootstrap", sum(x[1] == "bootstrap" for x in calls), 5)
             check("bootstrap 失败恢复旧 plist", old_daily.read_bytes(), b"synthetic-old-plist")
             check("bootstrap 失败恢复旧权限", old_daily.stat().st_mode & 0o777, 0o640)
 
@@ -679,10 +679,10 @@ def test_policy_final_send_and_schedule():
                 installed = SC.apply(ApiCfg(), "/fake/python", str(root), skip_missing=False)
             finally:
                 SC.subprocess.run = old_run
-            check("API key 存在时四项安装成功", len(installed), 4)
+            check("API key 存在时五项安装成功", len(installed), 5)
             modes = [((SC.LAUNCH_AGENTS / f"{label}.plist").stat().st_mode & 0o777)
                      for label in installed]
-            check("含 secret 的 plist 全部 0600", modes, [0o600] * 4)
+            check("含 secret 的 plist 全部 0600", modes, [0o600] * 5)
         finally:
             SC.LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
     if old_key is not None:

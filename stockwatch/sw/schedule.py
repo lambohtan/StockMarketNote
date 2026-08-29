@@ -70,6 +70,7 @@ def plans(cfg, python_bin, workdir):
     dh, dm = _hm(cfg.get("schedule.compute_daily", "06:00"))
     rh, rm = _hm(cfg.get("schedule.compute_retry", "07:00"))
     wh, wm = _hm(cfg.get("schedule.compute_weekly", "06:30"))
+    lh, lm = _hm(cfg.get("schedule.pool_daily", "06:45"))
     ph, pm = _hm(cfg.get("schedule.push_time", "08:00"))
     weekday = str(cfg.get("schedule.weekly_day", "tuesday")).strip().lower()
     if weekday not in WEEKDAYS:
@@ -92,6 +93,9 @@ def plans(cfg, python_bin, workdir):
         {"label": f"{PREFIX}-compute-weekly",
          "args": [python_bin, str(Path(workdir) / "run_weekly.py")],
          "calendar": {"Weekday": wd, "Hour": wh, "Minute": wm}, "env": env},
+        {"label": f"{PREFIX}-pool-daily",
+         "args": [python_bin, str(Path(workdir) / "run_pool.py")],
+         "calendar": {"Hour": lh, "Minute": lm}, "env": env},
         {"label": f"{PREFIX}-notify",
          "args": [python_bin, str(Path(workdir) / "run_notify.py")],
          "calendar": {"Hour": ph, "Minute": pm}, "env": None},

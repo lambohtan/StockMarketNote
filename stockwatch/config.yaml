@@ -92,6 +92,7 @@ schedule:
   compute_daily: "06:00"     # 开盘前 30 分钟（美股本机时区 06:30 开盘）—— 此时无当日半根 K 线
   compute_retry: "07:00"     # 06:00 失败时的重试；当天已成功则空跑退出
   compute_weekly: "06:30"    # 周报计算，与日报错开避免抢 SQLite 写锁
+  pool_daily: "06:45"        # 股票池深读，排在 compute_daily 之后、push_time 之前
   weekly_day: "tuesday"
   push_time: "08:00"         # ★ 你唯一能感知的时间：outbox 在这一刻统一发出
 

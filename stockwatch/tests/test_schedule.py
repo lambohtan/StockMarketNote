@@ -63,16 +63,19 @@ def test_weekday_mapping():
 
 
 def test_three_plans_from_config():
-    print("\n从 config 生成三个任务")
+    print("\n从 config 生成五个任务")
     ps = SC.plans(Cfg(), "/usr/bin/python3", "/tmp/wd")
     labels = [p["label"] for p in ps]
-    check("四个任务（日/重试/周/推送）", len(ps), 4)
+    check("五个任务（日/重试/周/池/推送）", len(ps), 5)
     check("含 compute-daily", "com.lambo.stockwatch-compute-daily" in labels, True)
     check("含 notify", "com.lambo.stockwatch-notify" in labels, True)
+    check("含 pool-daily", "com.lambo.stockwatch-pool-daily" in labels, True)
     daily = [p for p in ps if p["label"].endswith("compute-daily")][0]
     check("日报 06:00", daily["calendar"], {"Hour": 6, "Minute": 0})
     notify = [p for p in ps if p["label"].endswith("notify")][0]
     check("推送 08:00", notify["calendar"], {"Hour": 8, "Minute": 0})
+    pool_daily = [p for p in ps if p["label"].endswith("pool-daily")][0]
+    check("股票池深读 06:45", pool_daily["calendar"], {"Hour": 6, "Minute": 45})
     weekly = [p for p in ps if p["label"].endswith("compute-weekly")][0]
     check("周报 周二 06:30", weekly["calendar"],
           {"Weekday": 2, "Hour": 6, "Minute": 30})
@@ -133,8 +136,8 @@ def test_bootstrap_failure_not_reported_as_success_and_cli_nonzero():
             SC.LAUNCH_AGENTS, SC.subprocess.run = old_agents, old_run
 
         check("bootstrap 失败不进入 done", done, [])
-        check("四项均尝试 bootstrap",
-              sum(1 for argv in calls if argv[1] == "bootstrap"), 4)
+        check("五项均尝试 bootstrap",
+              sum(1 for argv in calls if argv[1] == "bootstrap"), 5)
 
         old_apply = SC.apply
         SC.apply = lambda *args, **kwargs: []
