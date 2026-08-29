@@ -8,7 +8,7 @@
 from datetime import datetime, timedelta
 from uuid import uuid4
 
-KINDS = ("daily", "weekly", "l1", "failure")
+KINDS = ("daily", "weekly", "l1", "failure", "pool")
 PRIORITIES = ("low", "default", "high", "urgent")
 CLAIM_LEASE_SECONDS = 300
 

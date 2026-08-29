@@ -109,6 +109,37 @@ CREATE TABLE IF NOT EXISTS outbox (
   attempts INTEGER DEFAULT 0,
   last_error TEXT
 );
+
+-- P4：财报正文缓存。按 accession + section 唯一，读过的申报不再下载。
+CREATE TABLE IF NOT EXISTS filing_texts (
+  accession   TEXT NOT NULL,
+  ticker      TEXT NOT NULL,
+  form        TEXT NOT NULL,
+  filed_at    TEXT NOT NULL,
+  section     TEXT NOT NULL,
+  content     TEXT NOT NULL,
+  fetched_at  TEXT NOT NULL,
+  PRIMARY KEY (accession, section)
+);
+CREATE INDEX IF NOT EXISTS idx_filing_texts_ticker ON filing_texts(ticker, filed_at);
+
+-- P4：深读结果快照，只追加。带模型名，换模型时能区分是模型变了还是公司变了。
+-- 这也是 P7 信号有效性追踪的数据基础，从第一天就要写。
+CREATE TABLE IF NOT EXISTS deepread_results (
+  d             TEXT NOT NULL,
+  ticker        TEXT NOT NULL,
+  source        TEXT NOT NULL,
+  py_hits       TEXT NOT NULL,
+  llm_hits      TEXT NOT NULL,
+  disagreements INTEGER NOT NULL,
+  score_hit     INTEGER NOT NULL,
+  score_total   INTEGER NOT NULL,
+  label         TEXT NOT NULL,
+  narrative     TEXT NOT NULL,
+  model         TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (d, ticker)
+);
 """
 
 
