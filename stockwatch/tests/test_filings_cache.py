@@ -104,6 +104,118 @@ def test_fetch_failure_is_not_fatal():
     st.close()
 
 
+def test_fetch_rejects_empty_accession_without_caching():
+    """I8：accession 取不到就是空串，但它是 filing_texts 的主键——空串是
+    合法主键值。放行会让第二只票的空 accession 命中第一只票用空 accession
+    存的缓存，把别家公司的 MD&A 当成自己的返回，还标 cached=True。
+    fetch() 必须直接判失败，绝不写入缓存。
+    """
+    st = fresh_store()
+    def fetcher(email, ticker):
+        return {"accession": "", "form": "10-Q", "filed_at": "2026-08-01",
+                "text": "AAPL 的 MD&A 正文"}
+    r = FT.fetch("a@b.com", "AAPL", st, fetcher=fetcher)
+    check("空 accession 直接失败", r.ok, False)
+    n = st.q("SELECT COUNT(*) c FROM filing_texts")[0]["c"]
+    check("不写入缓存", n, 0)
+    st.close()
+
+
+def test_empty_accession_does_not_pollute_across_tickers():
+    """修复前：两只票都拿到空 accession 时，第二只会读到第一只的缓存。"""
+    st = fresh_store()
+    def fetcher_for(text):
+        return lambda email, ticker: {
+            "accession": "", "form": "10-Q", "filed_at": "2026-08-01", "text": text}
+    r1 = FT.fetch("a@b.com", "AAPL", st, fetcher=fetcher_for("AAPL 正文"))
+    r2 = FT.fetch("a@b.com", "MSFT", st, fetcher=fetcher_for("MSFT 正文"))
+    check("两只票都各自失败，而不是第二只读到第一只的缓存",
+          (r1.ok, r2.ok), (False, False))
+    st.close()
+
+
+class _FakeFiling:
+    def __init__(self, accession, filed_at, text_val):
+        self.accession_no = accession
+        self.filing_date = filed_at
+        self._text = text_val
+
+    def text(self):
+        return self._text
+
+
+class _FakeFilings:
+    def __init__(self, latest_filing):
+        self._latest = latest_filing
+
+    def latest(self, n=1):
+        return self._latest
+
+
+class _FakeCompany:
+    def __init__(self, per_form):
+        self._per_form = per_form
+
+    def get_filings(self, form=None):
+        return self._per_form.get(form)
+
+
+def _with_fake_edgar_module(company):
+    """把假的 edgar 模块塞进 sys.modules，供 _edgar_fetcher 里
+    `from edgar import Company, set_identity` 拿到。"""
+    import sys, types
+    fake = types.ModuleType("edgar")
+    fake.Company = lambda ticker: company
+    fake.set_identity = lambda email: None
+    return fake
+
+
+def test_edgar_fetcher_picks_more_recent_filing_across_forms():
+    """I7：10-Q 和 10-K 各取一份 latest，按 filed_at 取更新的那份——不能
+    只要存在过 10-Q 就直接用它。公司刚发完年报时最近一份 10-Q 可能是半年
+    前的旧文件，旧实现会拿到比最新 10-K 更旧的材料，且 accession 不变时
+    第二天还会命中缓存，从外面完全看不出材料是旧的。
+    """
+    import sys
+    q = _FakeFiling("acc-q", "2026-02-01", "old 10-Q text")
+    k = _FakeFiling("acc-k", "2026-08-15", "new 10-K text")
+    company = _FakeCompany({"10-Q": _FakeFilings(q), "10-K": _FakeFilings(k)})
+    fake_module = _with_fake_edgar_module(company)
+    old = sys.modules.get("edgar")
+    sys.modules["edgar"] = fake_module
+    try:
+        meta = FT._edgar_fetcher("a@b.com", "NVDA")
+    finally:
+        if old is not None:
+            sys.modules["edgar"] = old
+        else:
+            del sys.modules["edgar"]
+    check("取的是更新的 10-K，不是存在过的 10-Q", meta["form"], "10-K")
+    check("filed_at 是较新的那份", meta["filed_at"], "2026-08-15")
+    check("accession 对应较新的那份", meta["accession"], "acc-k")
+    check("text callable 对应正确的申报", meta["text"](), "new 10-K text")
+
+
+def test_edgar_fetcher_picks_10q_when_it_is_the_newer_one():
+    """反向验证：不是硬编码偏向某个 form，纯按 filed_at 比较。"""
+    import sys
+    q = _FakeFiling("acc-q", "2026-08-20", "new 10-Q text")
+    k = _FakeFiling("acc-k", "2026-05-01", "old 10-K text")
+    company = _FakeCompany({"10-Q": _FakeFilings(q), "10-K": _FakeFilings(k)})
+    fake_module = _with_fake_edgar_module(company)
+    old = sys.modules.get("edgar")
+    sys.modules["edgar"] = fake_module
+    try:
+        meta = FT._edgar_fetcher("a@b.com", "NVDA")
+    finally:
+        if old is not None:
+            sys.modules["edgar"] = old
+        else:
+            del sys.modules["edgar"]
+    check("10-Q 更新时选 10-Q", meta["form"], "10-Q")
+    check("text callable 对应正确的申报", meta["text"](), "new 10-Q text")
+
+
 def test_cache_hit_does_not_pull_text():
     """裁定的锁：命中缓存时，text 的 callable 一次都不该被调用。
 
@@ -140,7 +252,11 @@ def test_cache_hit_does_not_pull_text():
 for fn in (test_first_fetch_hits_network_and_caches,
            test_second_fetch_same_accession_uses_cache,
            test_new_accession_refetches, test_previous_returns_prior_filing,
-           test_fetch_failure_is_not_fatal, test_cache_hit_does_not_pull_text):
+           test_fetch_failure_is_not_fatal, test_cache_hit_does_not_pull_text,
+           test_fetch_rejects_empty_accession_without_caching,
+           test_empty_accession_does_not_pollute_across_tickers,
+           test_edgar_fetcher_picks_more_recent_filing_across_forms,
+           test_edgar_fetcher_picks_10q_when_it_is_the_newer_one):
     print(fn.__name__)
     fn()
 

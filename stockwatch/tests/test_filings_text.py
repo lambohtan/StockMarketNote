@@ -62,9 +62,41 @@ def test_truncates_long_sections():
     check("超长章节被截断", len(out["mdna"]) <= FT.MAX_SECTION_CHARS, True)
 
 
+# I9（便宜的一半）：10-K 里 Item 1A 在前、MD&A（Item 7，这里的固件用
+# Item 2 简化模拟同样的结构问题）在后，MD&A 正文里"see Item 1A. Risk
+# Factors"这类后置交叉引用常见——_slice 取最后一次命中会落在这里，而
+# _RISK_END 在它之后找不到 Item 1B/2，于是把文档尾部一大段当成
+# risk_factors 抽出来。本轮只做检测：给 detail 加一层合理性检查。
+_CROSS_REF_10K = (
+    "Item 1A. Risk Factors\n"
+    "Real risk factor content goes here.\n"
+    "Item 1B. Unresolved Staff Comments\n"
+    "None.\n"
+    "Item 2. Management's Discussion and Analysis\n"
+    "We faced various challenges, see Item 1A. Risk Factors for details.\n"
+    "Item 3. Quantitative"
+)
+
+
+def test_extraction_warnings_flags_cross_reference():
+    """最后一次命中落在句中交叉引用上时，detail 至少要能报出可疑，
+    不能和干净抽取一样 ok=True、detail=''。"""
+    warnings = FT.extraction_warnings(_CROSS_REF_10K)
+    check("risk_factors 抽取被标记为可疑",
+          any("risk_factors" in w for w in warnings), True)
+
+
+def test_extraction_warnings_silent_on_clean_heading():
+    """真实固件里独立成行的标题（不是句中引用）不该被误判为可疑。"""
+    warnings = FT.extraction_warnings(FIXTURE)
+    check("干净抽取没有警告", warnings, [])
+
+
 for fn in (test_returns_both_keys_always, test_mdna_extracted,
            test_mdna_not_table_of_contents, test_risk_factors_extracted,
-           test_curly_apostrophe, test_truncates_long_sections):
+           test_curly_apostrophe, test_truncates_long_sections,
+           test_extraction_warnings_flags_cross_reference,
+           test_extraction_warnings_silent_on_clean_heading):
     print(fn.__name__)
     fn()
 
