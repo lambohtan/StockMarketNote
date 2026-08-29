@@ -101,6 +101,43 @@ def test_money_guard_wider_wordings():
     print("  ✅ 百分比 / σ 值 / 市盈率 / 天数 / 年份 / 排名 / 家数 正常放行")
 
 
+def test_money_guard_compound_magnitude_words():
+    """
+    Task 9 修复轮 1 · Important 2：复审实测 _QTY 量词组（千万/万/亿）
+    同时漏掉「万亿/百万/十亿/千亿」这四个复合量级词——LLM 摘要经常把英文
+    原文的 "$13 trillion"、"$2.5 million" 直接译成这类写法，覆盖面比
+    Task 8 修复轮 1 处理的那批单字量词宽得多。而且 sw/alerts.py 是
+    `from .notify import MONEY_RE` 复用同一份正则，这里补全，L1 推送的
+    金额清洗自动受益。
+
+    必须拦下 / 必须放行两组都断言上，防止以后改正则时只顾一边——尤其是
+    "一万亿市值""元宇宙概念股""美元指数走强""单元测试覆盖率"这四条，
+    它们都含"万亿/元/美元"但不是"数字紧邻币种"的搭配，是最容易被改
+    过头的误伤候选。
+    """
+    print("\n金额守卫：万亿 / 百万 / 十亿 / 千亿 等复合量级词")
+    # 必须拦下
+    check_raises("万亿美元被拦下", lambda: NT.assert_no_money("分析师称市值达 13 万亿美元"))
+    check_raises("百万美元被拦下", lambda: NT.assert_no_money("回购规模 2.5 百万美元"))
+    check_raises("十亿美元被拦下", lambda: NT.assert_no_money("投资总额 30 十亿美元"))
+    check_raises("千亿美元被拦下", lambda: NT.assert_no_money("估值约 5 千亿美元"))
+    check_raises("万亿元被拦下", lambda: NT.assert_no_money("总市值 1.2 万亿元"))
+
+    # 必须放行：推送正文的主要内容，以及"含万亿/元/美元但数字不紧邻币种"
+    # 的场景，都不能被新扩的量词组误伤
+    for text in [
+        "-8.7%", "+6.2%", "2.4σ", "市盈率 24.5", "过去 60 日走势偏弱",
+        "2026 年财报季", "讨论量排名第 3 名", "3 家基金本季新建仓",
+        "从 78 名升至 19 名", "R² 0.55", "beta 1.6",
+        "一万亿市值",       # "一"是中文数字，不是 \d，不该被数字量词规则命中
+        "元宇宙概念股",     # "元"前面没有数字
+        "美元指数走强",     # "美元"前面没有数字
+        "单元测试覆盖率",   # "元"是"单元"的一部分，前面没有数字
+    ]:
+        NT.assert_no_money(text)
+    print("  ✅ 复合量级词正确拦下，推送主要内容与近形词均未被误伤")
+
+
 def test_drain_sends_and_marks():
     print("\ndrain 发送并标记（claim/release 流程）")
     st, cfg = fresh_store(), FakeCfg()
@@ -183,6 +220,7 @@ def test_claimed_entry_is_skipped():
 if __name__ == "__main__":
     test_money_guard()
     test_money_guard_wider_wordings()
+    test_money_guard_compound_magnitude_words()
     test_drain_sends_and_marks()
     test_failure_reported_when_no_daily()
     test_no_false_failure_when_daily_exists()

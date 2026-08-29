@@ -24,8 +24,16 @@ def check(name, got, want):
         FAIL.append(name)
 
 
-def seeded_store(anomaly=True):
-    """造一个含 SPY / XLK / ABCD 的库。ABCD 最后一天注入 3σ 冲击。"""
+def seeded_store(anomaly=True, shock=3.2):
+    """造一个含 SPY / XLK / ABCD 的库。ABCD 最后一天注入 shock×σ 冲击（默认 +3.2σ）。
+
+    shock 支持负数、支持超过 4.0——修复轮 1 之前的默认值 +3.2σ 只够到
+    L2（`sw/alerts.py` 的 L1 判据是「z ≤ -4.0」或「8-K 命中 L1 item」，
+    正向异动、且 |z|<4 永远够不到 L1），导致 L1 单独入队那条分支
+    （`run_daily.py::emit()` 里 priority="urgent" 的独立 outbox 记录）
+    从来没有测试真正跑到过。这里把注入冲击的大小和方向都开放出来，供
+    L1 场景按需构造。
+    """
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); tmp.close()
     st = Store(tmp.name)
     rng = np.random.default_rng(5)
@@ -42,7 +50,7 @@ def seeded_store(anomaly=True):
     sigma = 0.004
     idio = rng.normal(0, sigma, n)
     if anomaly:
-        idio[-1] += 3.2 * sigma
+        idio[-1] += shock * sigma
     tgt = 1.2 * mkt + 0.7 * sec + idio
 
     def to_rows(tk, rets):
@@ -182,12 +190,75 @@ def test_main_drains_when_past_push_time():
     check("过了推送点，main() 自己调用了一次 drain", len(calls), 1)
 
 
+def test_l1_alert_enqueued_on_extreme_negative_move():
+    """
+    L1 判据 1：残差 z ≤ -4.0（不依赖 8-K）。
+
+    修复轮 1 · Important 1：emit() 里「L1 单独入队为 priority=urgent 独立
+    通知」这段此前没有任何测试覆盖——把整段删掉，原有 12 项断言照样全绿。
+    根因是 seeded_store 默认只注入 +3.2σ（正向、且够不到 4.0 门槛），
+    L1 从来没在测试里真正触发过。这里用 shock=-5.5 构造一次确定能过
+    -4.0 门槛的负向极端冲击（实测 z≈-4.68，留了足够裕量，不是卡在边界上）。
+    """
+    print("\n残差 z ≤ -4.0 时，L1 提醒应作为独立 outbox 条目入队（priority=urgent）")
+    st, last_d = seeded_store(shock=-5.5)
+    ctx = RD.build_context(st, Cfg(), snapshot_date=last_d, use_llm=False)
+    l1_alerts = [a for a in ctx["alerts"] if a["level"] == "L1"]
+    check("build_context 产出至少 1 条 L1 提醒", len(l1_alerts) >= 1, True)
+
+    RD.emit(st, Cfg(), ctx, dry_run=False)
+    l1_rows = st.q("SELECT id, kind, priority FROM outbox WHERE kind='l1'")
+    daily_rows = st.q("SELECT id, kind FROM outbox WHERE kind='daily'")
+    check("入队 1 条独立的 l1 记录", len(l1_rows), 1)
+    check("l1 记录 priority=urgent", l1_rows[0]["priority"] if l1_rows else None, "urgent")
+    check("daily 记录仍然只有 1 条", len(daily_rows), 1)
+    # daily 和 l1 是 outbox 里两条不同 id 的独立记录，不是拼在一起的一条。
+    check("daily 与 l1 是两条不同 id 的独立记录",
+          bool(daily_rows) and bool(l1_rows) and daily_rows[0]["id"] != l1_rows[0]["id"],
+          True)
+    st.close()
+
+
+def test_l1_alert_enqueued_on_8k_l1_item():
+    """
+    L1 判据 2：8-K 命中 L1 item（如 5.02 高管变动），不依赖 z 阈值。
+
+    普通的 +3.2σ 异动（level="anomaly"，够不到 z≤-4.0）配合一条落在
+    异动日回溯窗口内、items 含 5.02 的 8-K 申报，也应该触发 L1——
+    scan() 里 `if l1_causes: level = "L1"` 这条判据完全不看 z。
+    """
+    print("\n8-K 命中 L1 item 时，L1 提醒也应该作为独立 outbox 条目入队")
+    st, last_d = seeded_store()  # 默认 anomaly=True, shock=3.2 —— level=anomaly 即可
+    st.upsert_many(
+        "edgar_filings",
+        ["accession", "filed_at", "ticker", "cik", "form", "items",
+         "url", "raw_json", "seen_at"],
+        [("acc-test-502", last_d, "ABCD", "0000000000", "8-K", "5.02",
+          "https://sec.gov/acc-test-502", "{}", last_d)])
+
+    ctx = RD.build_context(st, Cfg(), snapshot_date=last_d, use_llm=False)
+    l1_alerts = [a for a in ctx["alerts"] if a["level"] == "L1"]
+    check("8-K 5.02 触发至少 1 条 L1 提醒", len(l1_alerts) >= 1, True)
+
+    RD.emit(st, Cfg(), ctx, dry_run=False)
+    l1_rows = st.q("SELECT id, kind, priority FROM outbox WHERE kind='l1'")
+    daily_rows = st.q("SELECT id, kind FROM outbox WHERE kind='daily'")
+    check("入队 1 条独立的 l1 记录", len(l1_rows), 1)
+    check("l1 记录 priority=urgent", l1_rows[0]["priority"] if l1_rows else None, "urgent")
+    check("daily 与 l1 是两条不同 id 的独立记录",
+          bool(daily_rows) and bool(l1_rows) and daily_rows[0]["id"] != l1_rows[0]["id"],
+          True)
+    st.close()
+
+
 if __name__ == "__main__":
     test_anomaly_produces_daily_entry()
     test_no_anomaly_still_produces_entry()
     test_rerun_is_idempotent()
     test_force_allows_rerun()
     test_main_drains_when_past_push_time()
+    test_l1_alert_enqueued_on_extreme_negative_move()
+    test_l1_alert_enqueued_on_8k_l1_item()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
