@@ -84,6 +84,10 @@ def test_all_hit():
 def test_details_are_human_readable():
     r = C.evaluate(facts(revenue_yoy=0.94))
     check("细节里带具体数值", "94" in r["details"]["revenue_growth"], True)
+    # operating_cash_flow 曾是六条里唯一不带数值的一条（只写「为正/为负」），
+    # 与「报告里每个数字都能追溯」的要求有落差；这里锁住修复。
+    r2 = C.evaluate(facts(operating_cash_flow=1.2e10))
+    check("现金流细节里也带具体数值", "12,000,000,000" in r2["details"]["operating_cash_flow"], True)
 
 
 for fn in (test_revenue_growth_boundary, test_cash_flow_boundary,

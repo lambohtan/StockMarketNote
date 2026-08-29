@@ -43,7 +43,8 @@ def evaluate(facts):
     v = facts.get("operating_cash_flow")
     hits["operating_cash_flow"] = None if v is None else v > 0
     details["operating_cash_flow"] = (
-        "数据缺失" if v is None else ("经营现金流为正" if v > 0 else "经营现金流为负"))
+        "数据缺失" if v is None
+        else f"经营现金流 {v:,.0f}（{'为正' if v > 0 else '为负'}）")
 
     v = facts.get("gross_margin_delta_pt")
     hits["gross_margin"] = None if v is None else v >= GROSS_MARGIN_TOLERANCE_PT

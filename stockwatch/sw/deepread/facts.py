@@ -13,8 +13,8 @@ import warnings
 from datetime import date, timedelta
 
 FIELDS = ("revenue_yoy", "operating_cash_flow", "gross_margin_delta_pt",
-          "avg_corr_to_holdings", "rank", "rank_prev", "rank_delta",
-          "pe", "forward_pe")
+          "avg_corr_to_holdings", "form4_filings_30d", "rank", "rank_prev",
+          "rank_delta", "pe", "forward_pe")
 
 
 def financials(ticker):
@@ -139,17 +139,36 @@ def collect(store, cfg, ticker, d, held_tickers=None, fin=None):
     if errors:
         _log_financials_health(store, ticker, errors)
 
+    # 显式写 source='all-stocks'，不要靠 ORDER BY source LIMIT 1 碰运气拿到它。
+    # 这个源名是用户批准「前 20 含前 10」时换来的接盘风险披露口径
+    # （pool.reddit_top 用的也是这个 source），源名一变这里就该跟着断，
+    # 而不是字典序悄悄取到别的榜单。
     rows = store.q(
         "SELECT rank, rank_24h_ago FROM reddit_rank WHERE d=? AND ticker=? "
-        "AND COALESCE(TRIM(ticker),'')<>'' ORDER BY source LIMIT 1", (d, ticker))
+        "AND source='all-stocks' AND COALESCE(TRIM(ticker),'')<>'' LIMIT 1",
+        (d, ticker))
     rank = rows[0]["rank"] if rows else None
     prev = rows[0]["rank_24h_ago"] if rows else None
 
     lo = (date.fromisoformat(d) - timedelta(days=30)).isoformat()
-    n4 = store.q(
-        "SELECT COUNT(DISTINCT accession) c FROM edgar_filings "
-        "WHERE form='4' AND ticker=? AND filed_at>=? AND filed_at<=?",
-        (ticker, lo, d))[0]["c"]
+    # run_ingest 只对持仓票按需查 EDGAR；全市场扫描行的 ticker 是空串
+    # （CIK_TICKER_MAP 生产里为空）。所以「这只票在窗口内完全没有任何
+    # edgar_filings 行」和「查过、确实没有 Form 4 申报」是两码事：前者是
+    # 「没查过」，绝不能报 0 —— 那会被 criteria.evaluate 判成硬「未命中」，
+    # 而实际上根本没有取数（spec §6：绝不把取不到数伪装成不符合）。
+    # 只有该 ticker 在窗口内确实有过至少一条（任意 form）申报记录时，
+    # 才说明这只票在这段时间被 EDGAR 覆盖到了，0 份 Form 4 才是一个真判定。
+    covered = store.q(
+        "SELECT COUNT(*) c FROM edgar_filings WHERE ticker=? "
+        "AND filed_at>=? AND filed_at<=?", (ticker, lo, d))[0]["c"]
+    if covered:
+        n4 = store.q(
+            "SELECT COUNT(DISTINCT accession) c FROM edgar_filings "
+            "WHERE form='4' AND ticker=? AND filed_at>=? AND filed_at<=?",
+            (ticker, lo, d))[0]["c"]
+        form4_filings_30d = int(n4)
+    else:
+        form4_filings_30d = None    # 这只票在窗口内没有任何 EDGAR 覆盖，不是「查到 0 份」
 
     out = {
         "ticker": ticker,
@@ -157,7 +176,7 @@ def collect(store, cfg, ticker, d, held_tickers=None, fin=None):
         "operating_cash_flow": _nan_to_none(f.get("operating_cash_flow")),
         "gross_margin_delta_pt": _nan_to_none(f.get("gross_margin_delta_pt")),
         "avg_corr_to_holdings": _corr_to_holdings(store, ticker, held, market),
-        "form4_filings_30d": int(n4),        # 查得到但没有申报就是 0，不是缺失
+        "form4_filings_30d": form4_filings_30d,
         "rank": rank,
         "rank_prev": prev,
         "rank_delta": (prev - rank) if (rank is not None and prev is not None) else None,

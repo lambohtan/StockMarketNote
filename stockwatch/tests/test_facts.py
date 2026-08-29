@@ -65,8 +65,33 @@ def test_missing_is_none_not_zero():
     check("营收增速缺失是 None", f["revenue_yoy"], None)
     check("现金流缺失是 None", f["operating_cash_flow"], None)
     check("排名缺失是 None", f["rank"], None)
-    check("Form4 无申报是 0 不是 None", f["form4_filings_30d"], 0)
+    # I1：ABCD 在窗口内完全没有任何 edgar_filings 行 —— 这只票根本没被
+    # EDGAR 查过（全市场扫描行 ticker 是空串，ingest 只按持仓逐个查 Form 4，
+    # 新票的 edgar_filings 天然是空的）。没查过不能报 0：报 0 会被
+    # criteria.evaluate 判成硬「未命中」，把「没查」伪装成「查了没有」。
+    check("没有 EDGAR 覆盖时 Form4 是 None 不是 0", f["form4_filings_30d"], None)
     check("缺失项被登记", "revenue_yoy" in f["missing"], True)
+    check("Form4 缺失也被登记", "form4_filings_30d" in f["missing"], True)
+    st.close()
+
+
+def test_form4_zero_only_when_edgar_covers_ticker():
+    """区分「没查过」与「查过、确实 0 份」：只有窗口内有任意申报行才报数。
+
+    这是 I1 修复的核心断言：只塞一条非 Form 4 的申报（比如 8-K），证明
+    这只票在窗口内确实被 EDGAR 覆盖到了 —— 这种情况下 Form 4 数量必须是
+    确定的 0（criteria 仍应判「未命中」），而不是退化成 None（那样反而
+    会把一个真实的「不符合」错误地缩小分母、算成「不知道」）。
+    """
+    st = fresh_store()
+    st.insert_ignore_many(
+        "edgar_filings", ("accession", "filed_at", "ticker", "cik", "form",
+                          "items", "url", "raw_json", "seen_at"),
+        [("acc-8k", "2026-08-20", "NVDA", "1", "8-K", "", "", "{}", "x")])
+    f = F.collect(st, Cfg(), "NVDA", "2026-08-29", held_tickers=[],
+                  fin=lambda tk: {})
+    check("被覆盖但 0 份 Form4 时是确定的 0", f["form4_filings_30d"], 0)
+    check("确定的 0 不进 missing", "form4_filings_30d" in f["missing"], False)
     st.close()
 
 
@@ -138,6 +163,7 @@ def test_financials_partial_error_logs_health():
 
 
 for fn in (test_collects_all_fields, test_missing_is_none_not_zero,
+           test_form4_zero_only_when_edgar_covers_ticker,
            test_financials_failure_does_not_raise, test_no_holdings_means_corr_unknown,
            test_nan_is_treated_as_missing, test_rank_delta_missing_when_no_prior_rank,
            test_financials_partial_error_logs_health):
