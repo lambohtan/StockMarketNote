@@ -98,6 +98,9 @@ def test_no_anomaly_still_produces_entry():
     st, last_d = seeded_store(anomaly=False)
     ctx = RD.build_context(st, Cfg(), snapshot_date=last_d, use_llm=False)
     check("没有异动", [a for a in ctx["attributions"] if a["level"] != "normal"], [])
+    # 正常持仓不该被送去找原因——EDGAR/新闻查询和后续 LLM 摘要都要消耗
+    # 额度，只有异动才值得查。
+    check("正常持仓没有被送去找原因", ctx["causes_by_ticker"], {})
     RD.emit(st, Cfg(), ctx, dry_run=False)
     check("仍然入队 daily", OB.has_kind_on(st, "daily", ctx["d"]), True)
     st.close()
