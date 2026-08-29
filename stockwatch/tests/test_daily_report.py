@@ -90,9 +90,30 @@ def test_empty_day_is_still_valid():
     check("说明今天无异动", "无异常" in md or "无异动" in md, True)
 
 
+def test_push_blocks_money_leaking_from_causes():
+    """
+    金额守卫不能只防模板本身写死的文案 —— causes 的 summary 来自新闻/
+    8-K/LLM 摘要，是外部输入，一样可能带金额。这里直接让一条 causes
+    summary 里混进金额，验证 render_push 真的会拦下来，而不是因为
+    默认测试数据里从来没出现过金额，导致内部的 assert_no_money 形同摆设。
+    """
+    print("\n推送正文的金额守卫必须覆盖 causes 带来的文本（不只是模板本身）")
+    ctx = make_ctx()
+    ctx["causes_by_ticker"]["ABCD"] = [
+        {"source": "新闻", "summary": "分析师预计相关支出约 1,234,567 美元",
+         "url": "https://example.com", "item": None, "is_l1": False},
+    ]
+    try:
+        DR.render_push(ctx)
+        check("causes 里的金额被 render_push 拦下（未抛异常）", False, True)
+    except ValueError:
+        check("causes 里的金额被 render_push 的 assert_no_money 拦下", True, True)
+
+
 if __name__ == "__main__":
     test_quiet_holdings_are_absent()
     test_push_has_no_money_and_no_directives()
+    test_push_blocks_money_leaking_from_causes()
     test_decomposition_shown()
     test_empty_day_is_still_valid()
     print("\n" + "=" * 50)
