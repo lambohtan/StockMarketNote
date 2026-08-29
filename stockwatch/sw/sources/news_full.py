@@ -60,6 +60,11 @@ def fetch(ticker, max_items=4, opener=None, headlines=None, timeout=10):
             degraded += 1
         rows.append({"title": title, "url": url, "text": text, "full": full})
 
+    # 全部条目都降级成标题 —— 新闻站全面挡爬虫或整批 URL 打不开，
+    # 这是抓取链路本身出了问题，不能仍报 ok=True：source_health 记的是
+    # 「健康」会让这种系统性失败完全隐形。只要有一条拿到了全文，就说明
+    # 抓取链路没坏，仍然 ok（单条失败不代表整体失败）。
+    all_degraded = bool(rows) and degraded == len(rows)
     detail = f"{degraded}/{len(rows)} 条只拿到标题" if degraded else ""
-    return SourceResult(source="news.full", ok=True, rows=len(rows),
+    return SourceResult(source="news.full", ok=not all_degraded, rows=len(rows),
                         data=rows, detail=detail)

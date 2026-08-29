@@ -64,14 +64,34 @@ def test_fetch_uses_full_text_when_available():
 
 
 def test_fetch_degrades_to_title_on_error():
+    """一条失败、另一条正常 —— 整体仍报 ok（部分降级不是系统性失败）。"""
     def opener(url, timeout=10):
-        raise TimeoutError("站点挡了")
+        if url.endswith("/1"):
+            raise TimeoutError("站点挡了")
+        return HTML_LONG
+    items = [{"summary": "NVDA 财报", "url": "http://x/1"},
+             {"summary": "NVDA 财报二条", "url": "http://x/2"}]
+    r = NF.fetch("NVDA", max_items=2, opener=opener,
+                 headlines=lambda tk, n: items)
+    check("部分降级时整体仍报 ok", r.ok, True)
+    check("失败那条降级成标题", r.data[0]["text"], "NVDA 财报")
+    check("失败那条如实标记不是全文", r.data[0]["full"], False)
+    check("成功那条标记为全文", r.data[1]["full"], True)
+
+
+def test_fetch_all_degraded_reports_not_ok():
+    """全部条目都降级成标题 —— 新闻站全面挡爬虫，不能仍报 ok=True。
+
+    修复前这里恒为 ok=True，source_health 记的是「健康」，全面挡爬虫这种
+    系统性失败会完全隐形；这条测试把回归退回旧行为就会转红。
+    """
+    def opener(url, timeout=10):
+        raise TimeoutError("站点全面挡了")
     items = [{"summary": "NVDA 财报", "url": "http://x/1"}]
     r = NF.fetch("NVDA", max_items=1, opener=opener,
                  headlines=lambda tk, n: items)
-    check("单条失败不影响整体", r.ok, True)
-    check("降级成标题", r.data[0]["text"], "NVDA 财报")
-    check("如实标记不是全文", r.data[0]["full"], False)
+    check("全部降级时报 ok=False", r.ok, False)
+    check("仍然如实降级成标题（不是连数据都不给）", r.data[0]["text"], "NVDA 财报")
 
 
 def test_short_body_counts_as_not_full():
@@ -95,6 +115,7 @@ def test_no_url_degrades():
 for fn in (test_html_to_text_strips_script_and_style,
            test_fetch_uses_full_text_when_available,
            test_fetch_degrades_to_title_on_error,
+           test_fetch_all_degraded_reports_not_ok,
            test_short_body_counts_as_not_full, test_no_url_degrades):
     print(fn.__name__)
     fn()
