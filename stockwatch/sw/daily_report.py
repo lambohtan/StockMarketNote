@@ -1,0 +1,111 @@
+"""
+日报渲染。两套输出：
+
+  render_markdown  完整版，存 reports 表和 reports/ 目录，可含金额
+  render_push      推送版，经 ntfy.sh 公共服务器，**绝不含金额**
+
+⭐ 最重要的设计：残差在正常范围的持仓**根本不出现在报告里**。
+日报一半的价值来自它不说什么 —— 每天列出 26 只票的涨跌等于没有信息。
+"""
+from .alerts import assert_no_directives, render_alert, render_alert_push
+from .notify import assert_no_money
+
+
+def _movers(ctx):
+    """只挑出异动的，按 |z| 降序。"""
+    xs = [a for a in ctx["attributions"] if a.get("level") in ("anomaly", "extreme")]
+    return sorted(xs, key=lambda a: -abs(a.get("z") or 0))
+
+
+def _fmt_line(a, causes):
+    reason = "未找到明确原因"
+    if causes:
+        reason = causes[0]["summary"]
+    return (
+        f"**{a['ticker']}**　{a['ret']*100:+.1f}%\n"
+        f"　　其中大盘 {a['mkt_part']*100:+.1f}%，"
+        f"行业 {a['sector_part']*100:+.1f}%，"
+        f"个股独立 {a['idio']*100:+.1f}%（{a['z']:+.1f}σ）\n"
+        f"　　原因：{reason}"
+    )
+
+
+def render_markdown(ctx):
+    movers = _movers(ctx)
+    total = len(ctx["attributions"])
+    quiet = total - len(movers)
+    L = [f"# 每日简报 · {ctx['d']}", ""]
+
+    if movers:
+        L.append(f"## 持仓异动（{len(movers)} 项，其余 {quiet} 只无异常）")
+        L.append("")
+        for a in movers:
+            L.append(_fmt_line(a, ctx["causes_by_ticker"].get(a["ticker"])))
+            L.append("")
+    else:
+        L += [f"## 持仓异动", "",
+              f"今天 {total} 只持仓**全部无异常** —— "
+              f"个股独立部分都在 2σ 以内，涨跌可由大盘和行业解释。", ""]
+
+    if ctx.get("alerts"):
+        L += ["## 需要注意的信号", ""]
+        for al in ctx["alerts"]:
+            L.append(render_alert(al, holding=None))
+            L.append("")
+
+    if ctx.get("watchlist_events"):
+        L += ["## 观察池", ""]
+        for e in ctx["watchlist_events"]:
+            L.append(f"- {e}")
+        L.append("")
+
+    m = ctx.get("market") or {}
+    if m:
+        bits = []
+        if m.get("spy_vs_200d") is not None:
+            bits.append(f"SPY 位于 200 日线{'上方' if m['spy_vs_200d'] >= 0 else '下方'}"
+                        f" {abs(m['spy_vs_200d'])*100:.1f}%")
+        if m.get("vix") is not None:
+            bits.append(f"VIX {m['vix']:.1f}")
+        if bits:
+            L += ["## 市场环境", "", "　".join(bits), ""]
+
+    L += ["---", "",
+          "> 归因用过去 60 个交易日回归：个股收益 = α + β_市场×SPY + β_行业×行业ETF。",
+          "> 残差在 2σ 以内的持仓不在本报告中出现。**未经回测验证，不预测涨跌。**",
+          "> 本工具为个人研究用途，所有产出不构成投资建议。"]
+    md = "\n".join(L)
+    assert_no_directives(md)
+    return md
+
+
+def render_push(ctx):
+    """推送版：短、无金额、能在手机锁屏上读完要点。"""
+    movers = _movers(ctx)
+    total = len(ctx["attributions"])
+    title = f"StockWatch {ctx['d']}　异动 {len(movers)}/{total}"
+
+    L = []
+    if movers:
+        for a in movers[:5]:
+            causes = ctx["causes_by_ticker"].get(a["ticker"]) or []
+            reason = causes[0]["summary"] if causes else "未找到明确原因"
+            L.append(f"{a['ticker']} {a['ret']*100:+.1f}%"
+                     f"（个股独立 {a['idio']*100:+.1f}%，{a['z']:+.1f}σ）\n"
+                     f"  {reason[:80]}")
+        if len(movers) > 5:
+            L.append(f"…另有 {len(movers)-5} 项，详见面板")
+    else:
+        L.append(f"{total} 只持仓全部无异常，涨跌可由大盘和行业解释。")
+
+    if ctx.get("watchlist_events"):
+        L.append("")
+        L.append("观察池")
+        for e in ctx["watchlist_events"][:3]:
+            L.append(f"  {e}")
+
+    body = "\n".join(L)
+    assert_no_money(body)
+    assert_no_money(title)
+    assert_no_directives(body)
+    return title, body
