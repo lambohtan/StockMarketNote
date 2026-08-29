@@ -69,15 +69,25 @@ def test_push_strips_money_before_truncating():
     t, b = R.render_push(item(narrative="发生了什么：" + long_news))
     check("推送不含美元金额", "$" in b, False)
     check("推送在上限内", len(b.encode("utf-8")) <= R.MAX_PUSH_BYTES, True)
-    assert_no_money(b)      # 抛异常就是没做干净
-    check("金额守卫通过", True, True)
+    # assert_no_money 抛异常本身就是失败信号，不需要额外的恒真断言：
+    # 用 try/except 把它的判定接进 check()，失败时会有名字可查。
+    try:
+        assert_no_money(b)
+        ok = True
+    except ValueError:
+        ok = False
+    check("金额守卫通过", ok, True)
 
 
 def test_push_passes_directive_guard():
     t, b = R.render_push(item())
-    assert_no_directives(t)
-    assert_no_directives(b)
-    check("标签词过守卫", True, True)
+    try:
+        assert_no_directives(t)
+        assert_no_directives(b)
+        ok = True
+    except ValueError:
+        ok = False
+    check("标签词过守卫（标题与正文都不含指令性措辞）", ok, True)
 
 
 def test_push_title_carries_label_and_score():

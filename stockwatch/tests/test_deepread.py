@@ -124,6 +124,46 @@ def test_stage2_without_llm_still_produces_py_part():
     check("叙述里写明失败", "LLM 深读失败" in r["narrative"], True)
 
 
+def test_stage2_total_bounded_by_text_criteria_even_with_extraneous_llm_keys():
+    """C2 不变量：LLM 绝不能控制计分的分子和分母。
+
+    修复前 `text_hits` 未按 TEXT_CRITERIA 做 key 白名单也未强制 bool——
+    实测多返回 4 个自造 key 能把 5/6 变成 11/12「偏正面」。这里断言
+    total 永远不超过 py.total + len(TEXT_CRITERIA)，且额外 key 一个都
+    不进最终的 text_hits（不进计分、不进渲染）。
+    """
+    llm = {
+        "hits": {}, "quotes": {},
+        "text_hits": {
+            "guidance_direction": False, "no_new_risk": True,
+            # 模型自造的 4 个 key：不在 TEXT_CRITERIA 白名单里
+            "extra_bullish_1": True, "extra_bullish_2": True,
+            "extra_bullish_3": True, "extra_bullish_4": True,
+        },
+    }
+    r = D.stage2(Cfg(), "NVDA", PY_RESULT, llm, FACTS,
+                caller=lambda *a, **k: "发生了什么：略。")
+    check("分母不超过 py.total + len(TEXT_CRITERIA)",
+          r["total"] <= PY_RESULT["total"] + len(D.TEXT_CRITERIA), True)
+    check("分母精确等于 6+2，自造 key 一个都没混进分母",
+          r["total"], PY_RESULT["total"] + len(D.TEXT_CRITERIA))
+    check("text_hits 只剩白名单两个 key，自造 key 被丢弃",
+          sorted(r["text_hits"].keys()), sorted(D.TEXT_KEYS))
+    check("py 5 + llm 文本 1（no_new_risk）= 6，自造 key 没进分子",
+          r["hit"], PY_RESULT["hit"] + 1)
+
+
+def test_stage2_rejects_stringy_truthiness_in_text_hits():
+    """字符串 "false"/"no" 在 Python 里非空即真，绝不能被当成命中。"""
+    llm = {"hits": {}, "quotes": {},
+           "text_hits": {"guidance_direction": "false", "no_new_risk": "no"}}
+    r = D.stage2(Cfg(), "NVDA", PY_RESULT, llm, FACTS,
+                caller=lambda *a, **k: "发生了什么：略。")
+    check("字符串真值不算命中，两条都记 unknown 缩分母", r["hit"], PY_RESULT["hit"])
+    check("分母不含这两条（记 unknown，不是未命中）", r["total"], PY_RESULT["total"])
+    check("text_hits 两条都归一成 None", list(r["text_hits"].values()), [None, None])
+
+
 def test_llm_config_error_bubbles_up():
     """配置错误（provider 冲突/缺 key/未知 provider）绝不能被 stage1/stage2 吞成空结果。
 
@@ -161,6 +201,8 @@ for fn in (test_material_excludes_py_conclusions, test_stage1_parses_json,
            test_two_disagreements_lower_confidence,
            test_stage2_counts_text_hits_into_score,
            test_stage2_without_llm_still_produces_py_part,
+           test_stage2_total_bounded_by_text_criteria_even_with_extraneous_llm_keys,
+           test_stage2_rejects_stringy_truthiness_in_text_hits,
            test_llm_config_error_bubbles_up):
     print(fn.__name__)
     fn()
