@@ -77,6 +77,10 @@ def test_financials_failure_does_not_raise():
     f = F.collect(st, Cfg(), "NVDA", "2026-08-29", held_tickers=[], fin=boom)
     check("财务源挂了不抛异常", f["revenue_yoy"], None)
     check("其他字段照常", f["rank"], 12)
+    # 财务源整体抛异常也要留痕到 source_health，方便日后排查
+    rows = st.q("SELECT * FROM source_health WHERE source='yfinance.financials'")
+    check("整体异常写入 source_health", len(rows) >= 1, True)
+    check("留痕包含异常信息", "yfinance 挂了" in (rows[0]["detail"] if rows else ""), True)
     st.close()
 
 
@@ -87,8 +91,56 @@ def test_no_holdings_means_corr_unknown():
     st.close()
 
 
+def test_nan_is_treated_as_missing():
+    """NaN 不是合法数值 —— 它真值为 True、参与运算不抛异常，必须被拦成 None。"""
+    st = fresh_store(); seed(st)
+    nan_fin = dict(FIN)
+    nan_fin["revenue_yoy"] = float("nan")
+    nan_fin["operating_cash_flow"] = float("nan")
+    f = F.collect(st, Cfg(), "NVDA", "2026-08-29", held_tickers=[], fin=lambda tk: nan_fin)
+    check("NaN 营收增速折成 None", f["revenue_yoy"], None)
+    check("NaN 现金流折成 None", f["operating_cash_flow"], None)
+    check("NaN 字段进 missing", "revenue_yoy" in f["missing"], True)
+    check("NaN 现金流字段进 missing", "operating_cash_flow" in f["missing"], True)
+    # 未被污染的字段（毛利率环比、PE）应照常带出，证明拦截只作用于 NaN 本身
+    check("非 NaN 字段不受影响", f["gross_margin_delta_pt"], -0.4)
+    st.close()
+
+
+def test_rank_delta_missing_when_no_prior_rank():
+    """今天有排名、没有 24h 前排名（比如刚进榜）—— rank_prev/rank_delta 都应缺失。"""
+    st = fresh_store()
+    st.insert_ignore_many(
+        "reddit_rank", ("d", "source", "ticker", "rank", "mentions",
+                        "upvotes", "rank_24h_ago", "mentions_24h_ago"),
+        [("2026-08-29", "all-stocks", "NVDA", 12, 500, 100, None, None)])
+    f = F.collect(st, Cfg(), "NVDA", "2026-08-29", held_tickers=[], fin=lambda tk: FIN)
+    check("有排名", f["rank"], 12)
+    check("无前值排名是 None", f["rank_prev"], None)
+    check("无前值时排名变化是 None", f["rank_delta"], None)
+    check("rank_prev 进 missing", "rank_prev" in f["missing"], True)
+    check("rank_delta 进 missing", "rank_delta" in f["missing"], True)
+    st.close()
+
+
+def test_financials_partial_error_logs_health():
+    """financials() 内部单块失败（通过 _errors 上报）同样要留痕，不能悄悄消失。"""
+    st = fresh_store(); seed(st)
+    def partial(tk):
+        return {"pe": 52.3, "_errors": ["income_stmt KeyError: 'Total Revenue'"]}
+    f = F.collect(st, Cfg(), "NVDA", "2026-08-29", held_tickers=[], fin=partial)
+    check("_errors 不混入固定 key", "_errors" in f, False)
+    check("其他字段照常带出", f["pe"], 52.3)
+    rows = st.q("SELECT * FROM source_health WHERE source='yfinance.financials'")
+    check("单块失败写入 source_health", len(rows) >= 1, True)
+    check("留痕包含具体错误", "Total Revenue" in (rows[0]["detail"] if rows else ""), True)
+    st.close()
+
+
 for fn in (test_collects_all_fields, test_missing_is_none_not_zero,
-           test_financials_failure_does_not_raise, test_no_holdings_means_corr_unknown):
+           test_financials_failure_does_not_raise, test_no_holdings_means_corr_unknown,
+           test_nan_is_treated_as_missing, test_rank_delta_missing_when_no_prior_rank,
+           test_financials_partial_error_logs_health):
     print(fn.__name__)
     fn()
 
