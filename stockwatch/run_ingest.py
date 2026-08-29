@@ -54,7 +54,9 @@ def ingest_edgar(st, email, positions_tickers, dry_run=False,
     fetch_all = fetch_all or E.fetch_filings
     fetch_by_ticker = fetch_by_ticker or E.fetch_filings_for_tickers
 
-    eres = fetch_all(email, forms=("8-K", "4"))
+    # 13F-HR 本期不做 cluster 检测（属 P4），但先把数据攒起来 ——
+    # 和 Reddit 同理，早一天开始攒就早一天能回看
+    eres = fetch_all(email, forms=("8-K", "4", "13F-HR"))
     print(f"  {'✅' if eres.ok else '❌'} 全市场 {eres.rows} 条 ({eres.latency_ms}ms) {eres.detail}")
     if eres.rows > 0 and not dry_run:
         st.insert_ignore_many("edgar_filings", EDGAR_COLS, eres.data)

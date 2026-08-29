@@ -23,12 +23,20 @@ from sw.config import CFG
 from sw.store import Store
 from sw import outbox as OB, notify as NT, alerts as AL, llm as LM
 from sw import daily_report as DR
-from sw.analysis import portfolio as PF, attribution as AT, causes as CS
+from sw.analysis import portfolio as PF, attribution as AT, causes as CS, watchlist as WL
 from sw.market_time import et_today, now_et
 
 
 def log(m):
     print(f"[{datetime.now().isoformat(timespec='seconds')}] {m}", flush=True)
+
+
+def _watchlist(store, d, held):
+    try:
+        return WL.collect(store, d, held)
+    except Exception as e:
+        log(f"  ⚠️ 观察池汇总失败：{type(e).__name__}: {e}")
+        return []
 
 
 def build_context(store, cfg, snapshot_date=None, window=60, use_llm=True):
@@ -86,7 +94,7 @@ def build_context(store, cfg, snapshot_date=None, window=60, use_llm=True):
         "attributions": attributions,
         "causes_by_ticker": causes_by_ticker,
         "alerts": alerts,
-        "watchlist_events": [],      # P4 填充；本期留空
+        "watchlist_events": _watchlist(store, d, {h.ticker for h in p.holdings}),
         "market": {},                # 可选，缺失时报告自动省略该节
         "portfolio_weights": p.weights(),
         "n_holdings": len(p.holdings),

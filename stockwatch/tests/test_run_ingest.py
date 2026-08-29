@@ -136,6 +136,31 @@ def test_log_health_gets_real_ok():
     st.close()
 
 
+def test_edgar_form_scope_keeps_13f_market_wide_only():
+    """13F-HR 只走全市场扫描，按持仓查询仍只查 8-K / Form 4。"""
+    print("\nEDGAR 表单范围：全市场含 13F-HR，按持仓不含 13F-HR")
+    st = fresh_store()
+    calls = []
+
+    def fake_all(*a, **kw):
+        calls.append(("all", kw.get("forms")))
+        return SourceResult(source="edgar.filings", ok=True, rows=0,
+                            latency_ms=1, detail="", data=[])
+
+    def fake_by_ticker(*a, **kw):
+        calls.append(("by_ticker", kw.get("forms")))
+        return SourceResult(source="edgar.filings_by_ticker", ok=True, rows=0,
+                            latency_ms=1, detail="", data=[])
+
+    RI.ingest_edgar(st, "test@example.com", ["AAPL"], dry_run=False,
+                    fetch_all=fake_all, fetch_by_ticker=fake_by_ticker)
+    check("全市场查询包含 13F-HR",
+          calls[0][1] if calls else None, ("8-K", "4", "13F-HR"))
+    check("按持仓查询仍只查 8-K / 4",
+          calls[1][1] if len(calls) > 1 else None, ("8-K", "4"))
+    st.close()
+
+
 def test_main_writes_edgar_rows_even_when_ticker_query_partially_failed():
     """
     修复轮 2 遗留的端到端护栏：ingest_edgar 本身的单测再全，也防不住
@@ -199,6 +224,7 @@ if __name__ == "__main__":
     test_partial_failure_still_writes()
     test_market_wide_does_not_clobber()
     test_log_health_gets_real_ok()
+    test_edgar_form_scope_keeps_13f_market_wide_only()
     test_main_writes_edgar_rows_even_when_ticker_query_partially_failed()
     print("\n" + "=" * 50)
     if FAIL:

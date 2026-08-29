@@ -114,6 +114,39 @@ def test_no_anomaly_still_produces_entry():
     st.close()
 
 
+def test_build_context_collects_watchlist_events_fail_soft():
+    """build_context 使用 WL.collect，并在观察池源异常时降级为空列表。"""
+    print("\nbuild_context 应接入观察池汇总，且观察池失败时不中断日报")
+    st, last_d = seeded_store(anomaly=False)
+    calls = []
+    original_collect = RD.WL.collect
+
+    def fake_collect(store, d, held):
+        calls.append((store, d, held))
+        return ["合成观察池事件"]
+
+    try:
+        RD.WL.collect = fake_collect
+        ctx = RD.build_context(st, Cfg(), snapshot_date=last_d, use_llm=False)
+        check("watchlist_events 来自 WL.collect",
+              ctx["watchlist_events"], ["合成观察池事件"])
+        check("WL.collect 收到当前日期和持仓 ticker",
+              (calls[0][1], calls[0][2]) if calls else None,
+              (last_d, {"ABCD"}))
+
+        def failing_collect(*args, **kwargs):
+            raise RuntimeError("synthetic watchlist failure")
+
+        RD.WL.collect = failing_collect
+        ctx_failed = RD.build_context(st, Cfg(), snapshot_date=last_d,
+                                      use_llm=False)
+        check("观察池异常时返回空列表",
+              ctx_failed["watchlist_events"], [])
+    finally:
+        RD.WL.collect = original_collect
+        st.close()
+
+
 def test_rerun_is_idempotent():
     print("\n当天重跑不重复入队（07:00 重试任务依赖这个）")
     st, last_d = seeded_store()
@@ -254,6 +287,7 @@ def test_l1_alert_enqueued_on_8k_l1_item():
 if __name__ == "__main__":
     test_anomaly_produces_daily_entry()
     test_no_anomaly_still_produces_entry()
+    test_build_context_collects_watchlist_events_fail_soft()
     test_rerun_is_idempotent()
     test_force_allows_rerun()
     test_main_drains_when_past_push_time()
