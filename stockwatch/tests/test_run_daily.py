@@ -125,11 +125,66 @@ def test_force_allows_rerun():
     st.close()
 
 
+def test_main_drains_when_past_push_time():
+    """
+    睡过头竞态的堵法：main() 跑完发现已经过了推送点，要自己 drain 一次，
+    不能干等 08:00 那个独立任务——Mac 从 06:00 睡到 08:30 才醒的话，
+    06:00 这次运行本身就已经在推送点之后了。
+
+    不依赖真实挂钟时间是否已经过了 08:00（测试可能在一天里任何时刻跑）：
+    把 CFG 的 schedule.push_time 临时改成 "00:00"，任何 "HH:MM" 字符串
+    都 >= "00:00"，确保这条分支必进。同时把 sw.notify.drain 换成假实现，
+    只记录有没有被调用——真实 CFG 指向真实 ntfy topic，测试环境绝不能
+    真的发一条推送出去。全程用 STOCKWATCH_DB 指向临时库，不碰
+    data/stockwatch.db。
+    """
+    print("\nmain() 跑完发现已过推送点，应该自己 drain 一次（同一个 notify.drain，不是复制逻辑）")
+    import os, sys as _sys
+
+    st, last_d = seeded_store(anomaly=False)
+    db_path = str(st.path)
+    st.close()
+
+    orig_env = os.environ.get("STOCKWATCH_DB")
+    orig_argv = _sys.argv
+    push_cfg = RD.CFG._d.setdefault("schedule", {})
+    had_push_time = "push_time" in push_cfg
+    orig_push_time = push_cfg.get("push_time")
+    orig_drain = RD.NT.drain
+    calls = []
+
+    def fake_drain(store, cfg, *a, **kw):
+        calls.append((store, cfg))
+        return {"sent": 0, "failed": 0, "failure_reported": False}
+
+    try:
+        os.environ["STOCKWATCH_DB"] = db_path
+        _sys.argv = ["run_daily.py", "--skip-ingest"]
+        push_cfg["push_time"] = "00:00"
+        RD.NT.drain = fake_drain
+        rc = RD.main()
+    finally:
+        if orig_env is not None:
+            os.environ["STOCKWATCH_DB"] = orig_env
+        else:
+            os.environ.pop("STOCKWATCH_DB", None)
+        _sys.argv = orig_argv
+        if had_push_time:
+            push_cfg["push_time"] = orig_push_time
+        else:
+            push_cfg.pop("push_time", None)
+        RD.NT.drain = orig_drain
+
+    check("main() 正常退出（exit code 0）", rc, 0)
+    check("过了推送点，main() 自己调用了一次 drain", len(calls), 1)
+
+
 if __name__ == "__main__":
     test_anomaly_produces_daily_entry()
     test_no_anomaly_still_produces_entry()
     test_rerun_is_idempotent()
     test_force_allows_rerun()
+    test_main_drains_when_past_push_time()
     print("\n" + "=" * 50)
     if FAIL:
         print(f"❌ {len(FAIL)} 项未通过: {FAIL}")
