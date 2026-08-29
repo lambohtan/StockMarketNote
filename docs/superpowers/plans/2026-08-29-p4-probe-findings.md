@@ -3,6 +3,13 @@
 探测脚本：`tools/probe_p4.py`（实测运行，联网访问 SEC EDGAR 与 yfinance，无 mock）。
 运行环境：edgartools 5.53.0 · yfinance 1.7.0 · pandas（项目环境）· tiktoken 0.14.0（仅用于估算 token 数，见第 3 节说明）。
 
+本文档第 1、2 节主表（章节抽取、现金流命中）来自脚本的 `probe_edgar()` / `probe_cashflow()`
+（`=== 1. ===` / `=== 2. ===` 两段输出）。第 2 节的完整行名列表和第 3 节的 token 估算
+最初是修复轮之前用临时脚本手工跑出来的、无法从当时提交的 `probe_p4.py` 复现 ——
+审查指出后已把它们收编成脚本里正式的 `probe_cashflow_full_index()` 和 `probe_tokens()`
+两个函数（对应下面输出里的 `=== 2b. ===` / `=== 3. ===` 两段），现在跑
+`python3 tools/probe_p4.py` 会打印出与本文档完全一致的数字，不再需要额外的手工步骤。
+
 ## 1. EDGAR 章节抽取
 
 brief 里给的正则和取数写法（`Company(tk).get_filings(form="10-Q")` → `filings.latest(1)` →
@@ -58,7 +65,8 @@ MU 的 10-Q 正文里，「Item 1A」这几个字先后出现在：(1) 目录（
 不要用 `hit[0]`（模糊匹配结果的顺序取决于 DataFrame 原始行序，不保证 `Operating Cash Flow`
 排在前面 —— 实测三只票里它确实排在前面，但不应依赖这个巧合）。
 
-三只票完整行名列表（供 Task 6 参考，已确认三者都稳定包含 `Operating Cash Flow`）：
+三只票完整行名列表（`probe_cashflow_full_index()` 输出，供 Task 6 参考，
+已确认三者都稳定包含 `Operating Cash Flow`；重跑脚本可复现下列内容）：
 
 <details>
 <summary>AAPL（46 行）</summary>
@@ -134,10 +142,10 @@ Task 7 不需要删除 `operating_cash_flow` 这条标准，Task 9 分母基数�
 
 ## 3. 正文长度与 token
 
-除脚本自带的字符数统计外，额外用 `tiktoken`（`cl100k_base` 编码）对 MD&A 和风险因素
-抽出段落做了 token 估算 —— **注意**：项目实际用的是 `claude-opus-5`
-（见 `stockwatch/config.yaml` 的 `llm.model`），Claude 用的不是 `cl100k_base` 分词器，
-这里的 token 数只是数量级参考，不是精确值。
+除脚本自带的字符数统计外，`probe_tokens()` 额外用 `tiktoken`（`cl100k_base` 编码）
+对 MD&A 和风险因素抽出段落做了 token 估算（对应下方脚本输出的 `=== 3. ===` 段）——
+**注意**：项目实际用的是 `claude-opus-5`（见 `stockwatch/config.yaml` 的 `llm.model`），
+Claude 用的不是 `cl100k_base` 分词器，这里的 token 数只是数量级参考，不是精确值。
 
 | 票 | 全文 tokens | MD&A 长度 / tokens | 风险因素长度 / tokens | 两节合计长度 / tokens |
 |---|---|---|---|---|
