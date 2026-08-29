@@ -96,6 +96,13 @@ def test_push_blocks_money_leaking_from_causes():
     8-K/LLM 摘要，是外部输入，一样可能带金额。这里直接让一条 causes
     summary 里混进金额，验证 render_push 真的会拦下来，而不是因为
     默认测试数据里从来没出现过金额，导致内部的 assert_no_money 形同摆设。
+
+    Task 8 修复轮 2 Minor 之后的行为变化：reason 字段现在会在截断之前先
+    做 MONEY_RE 替换（跟 sw/alerts.py::render_alert_push 的「兜底替换」
+    设计保持一致），所以 causes 里的金额不再让 render_push 抛异常，而是
+    被静默替换成占位符后继续渲染——这是有意的行为变化，不是回归：
+    assert_no_money(body) 仍然保留作为最终防线，用来兜住 reason 替换
+    没覆盖到的其他字段（比如 watchlist_events、title）。
     """
     print("\n推送正文的金额守卫必须覆盖 causes 带来的文本（不只是模板本身）")
     ctx = make_ctx()
@@ -103,11 +110,9 @@ def test_push_blocks_money_leaking_from_causes():
         {"source": "新闻", "summary": "分析师预计相关支出约 1,234,567 美元",
          "url": "https://example.com", "item": None, "is_l1": False},
     ]
-    try:
-        DR.render_push(ctx)
-        check("causes 里的金额被 render_push 拦下（未抛异常）", False, True)
-    except ValueError:
-        check("causes 里的金额被 render_push 的 assert_no_money 拦下", True, True)
+    title, body = DR.render_push(ctx)
+    check("causes 里的裸金额没有原样出现在推送正文里", "1,234,567" in body, False)
+    check("金额被替换成了占位符", "[金额见面板]" in body, True)
 
 
 def test_markdown_blocks_directive_leaking_from_causes():
@@ -164,6 +169,37 @@ def test_no_attributions_is_reported_as_missing_data():
     check("没有误导性地说全部无异常", "0 只持仓**全部无异常**" in md, False)
 
 
+def test_push_money_survives_truncation_boundary():
+    """
+    Task 8 修复轮 2 Minor：render_push 里 reason[:80] 的字符截断如果发生
+    在金额替换之前，金额短语恰好跨在第 80 字符边界上时会被切碎——
+    比如「...累计成本约 50万」|「美元...」，截断后只剩裸的「50万」，
+    没有币种单位就不匹配 MONEY_RE，原样进了推送正文。
+
+    这里精确构造一条 causes summary：前缀正好 77 个字符，紧接着是
+    「50万美元」，这样 reason[:80] 的旧写法会恰好切在「万」和「美」
+    之间，只留下「50万」。用 assert 在测试内部先自检一次构造是否符合
+    预期（不然这条测试就测不到我们想测的场景），再验证 render_push
+    的真实输出里没有留下这个裸数量词。
+    """
+    print("\n金额短语跨在 80 字符截断边界上时也不能漏")
+    prefix = "情" * 77
+    summary = prefix + "50万美元，后续以公司披露为准"
+    # 自检：确认构造的字符串真的会把「50万」和「美元」切在截断边界两侧。
+    assert summary[:80] == prefix + "50万", "测试构造的边界不对，请检查前缀长度"
+    ctx = make_ctx()
+    ctx["causes_by_ticker"]["ABCD"] = [
+        {"source": "新闻", "summary": summary,
+         "url": "https://example.com", "item": None, "is_l1": False},
+    ]
+    title, body = DR.render_push(ctx)
+    check("裸的「50万」没有原样出现在推送正文里（应已被替换成占位符）",
+          "50万" in body, False)
+    check("推送正文含金额占位符的痕迹", "[金额" in body, True)
+    # 最终防线复核：即使占位符逻辑有问题，assert_no_money 也不能放过。
+    assert_no_money(body)
+
+
 if __name__ == "__main__":
     test_quiet_holdings_are_absent()
     test_push_has_no_money_and_no_directives()
@@ -171,6 +207,7 @@ if __name__ == "__main__":
     test_markdown_blocks_directive_leaking_from_causes()
     test_push_blocks_directive_leaking_from_causes()
     test_no_attributions_is_reported_as_missing_data()
+    test_push_money_survives_truncation_boundary()
     test_decomposition_shown()
     test_empty_day_is_still_valid()
     print("\n" + "=" * 50)

@@ -8,7 +8,7 @@
 日报一半的价值来自它不说什么 —— 每天列出 26 只票的涨跌等于没有信息。
 """
 from .alerts import assert_no_directives, render_alert
-from .notify import assert_no_money
+from .notify import assert_no_money, MONEY_RE
 
 
 def _movers(ctx):
@@ -104,6 +104,15 @@ def render_push(ctx):
         for a in movers[:5]:
             causes = ctx["causes_by_ticker"].get(a["ticker"]) or []
             reason = causes[0]["summary"] if causes else "未找到明确原因"
+            # 修复轮 2 Minor：金额替换必须在截断之前做。causes 的 summary
+            # 长度不受控（新闻/8-K/LLM 摘要），如果先截到 80 字符再校验，
+            # 金额短语恰好跨在第 80 字符边界上时会被切碎——比如
+            # 「…累计成本约 50万」|「美元…」，截断后只剩「50万」，没有
+            # 币种单位就不匹配 MONEY_RE，裸数量词就原样进了推送正文。
+            # 在完整字符串上先替换、再截断，就不存在「切碎金额短语绕过
+            # 校验」这个窗口。assert_no_money(body) 仍然保留作为最终防线，
+            # 不能因为加了这行替换就把它去掉。
+            reason = MONEY_RE.sub("[金额见面板]", reason)
             L.append(f"{a['ticker']} {a['ret']*100:+.1f}%"
                      f"（个股独立 {a['idio']*100:+.1f}%，{a['z']:+.1f}σ）\n"
                      f"  {reason[:80]}")
