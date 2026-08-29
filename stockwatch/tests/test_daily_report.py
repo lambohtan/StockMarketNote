@@ -110,10 +110,67 @@ def test_push_blocks_money_leaking_from_causes():
         check("causes 里的金额被 render_push 的 assert_no_money 拦下", True, True)
 
 
+def test_markdown_blocks_directive_leaking_from_causes():
+    """
+    Task 8 修复轮 1 Important 2：复审指出 render_markdown 里的
+    assert_no_directives 没有任何回归测试兜底——把它删掉，之前的
+    4 个测试仍然全绿。跟金额守卫是同一类盲区：默认测试数据里从来
+    没出现过指令性措辞，测试当然测不出「删掉守卫会怎样」。
+
+    这里让一条 causes summary（模拟 LLM 摘要）带上明确的指令性措辞，
+    验证 render_markdown 真的会因为 assert_no_directives 抛出 ValueError。
+    """
+    print("\nrender_markdown 的指令守卫必须覆盖 causes 带来的文本")
+    ctx = make_ctx()
+    ctx["causes_by_ticker"]["ABCD"] = [
+        {"source": "新闻", "summary": "你应该立即清仓 ABCD",
+         "url": "https://example.com", "item": None, "is_l1": False},
+    ]
+    try:
+        DR.render_markdown(ctx)
+        check("causes 里的指令措辞被 render_markdown 拦下（未抛异常）", False, True)
+    except ValueError:
+        check("causes 里的指令措辞被 render_markdown 的 assert_no_directives 拦下",
+              True, True)
+
+
+def test_push_blocks_directive_leaking_from_causes():
+    """同上，验证 render_push 侧也真的会拦。"""
+    print("\nrender_push 的指令守卫必须覆盖 causes 带来的文本")
+    ctx = make_ctx()
+    ctx["causes_by_ticker"]["ABCD"] = [
+        {"source": "新闻", "summary": "你应该立即清仓 ABCD",
+         "url": "https://example.com", "item": None, "is_l1": False},
+    ]
+    try:
+        DR.render_push(ctx)
+        check("causes 里的指令措辞被 render_push 拦下（未抛异常）", False, True)
+    except ValueError:
+        check("causes 里的指令措辞被 render_push 的 assert_no_directives 拦下",
+              True, True)
+
+
+def test_no_attributions_is_reported_as_missing_data():
+    """
+    Task 8 修复轮 1 Minor：attributions 为空时不能说成「持仓全部无异常」——
+    「没有可归因的持仓数据」和「持仓都正常」是两件事，混成一句会让人误以为
+    系统跑过归因、结果一切正常，实际上可能是持仓快照缺失或行情数据不足。
+    """
+    print("\n无归因数据时要明确说「没有数据」而不是「全部无异常」")
+    ctx = make_ctx()
+    ctx["attributions"] = []
+    md = DR.render_markdown(ctx)
+    check("说明没有可归因数据", "没有可归因的持仓数据" in md, True)
+    check("没有误导性地说全部无异常", "0 只持仓**全部无异常**" in md, False)
+
+
 if __name__ == "__main__":
     test_quiet_holdings_are_absent()
     test_push_has_no_money_and_no_directives()
     test_push_blocks_money_leaking_from_causes()
+    test_markdown_blocks_directive_leaking_from_causes()
+    test_push_blocks_directive_leaking_from_causes()
+    test_no_attributions_is_reported_as_missing_data()
     test_decomposition_shown()
     test_empty_day_is_still_valid()
     print("\n" + "=" * 50)

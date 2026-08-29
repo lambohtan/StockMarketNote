@@ -7,7 +7,7 @@
 ⭐ 最重要的设计：残差在正常范围的持仓**根本不出现在报告里**。
 日报一半的价值来自它不说什么 —— 每天列出 26 只票的涨跌等于没有信息。
 """
-from .alerts import assert_no_directives, render_alert, render_alert_push
+from .alerts import assert_no_directives, render_alert
 from .notify import assert_no_money
 
 
@@ -42,6 +42,13 @@ def render_markdown(ctx):
         for a in movers:
             L.append(_fmt_line(a, ctx["causes_by_ticker"].get(a["ticker"])))
             L.append("")
+    elif total == 0:
+        # 修复轮 1 Minor：没有归因数据和「持仓都正常」是两件事，混成一句
+        # 会让人误以为系统跑过归因、结果一切正常——实际可能是持仓快照
+        # 缺失或行情数据不足，这种情况要显式指向排查方向。
+        L += ["## 持仓异动", "",
+              "今天没有可归因的持仓数据 —— 可能是持仓快照缺失或行情数据"
+              "不足，请检查 `source_health`。", ""]
     else:
         L += [f"## 持仓异动", "",
               f"今天 {total} 只持仓**全部无异常** —— "
@@ -80,7 +87,14 @@ def render_markdown(ctx):
 
 
 def render_push(ctx):
-    """推送版：短、无金额、能在手机锁屏上读完要点。"""
+    """
+    推送版：短、无金额、能在手机锁屏上读完要点。
+
+    ⚠️ 本函数不渲染 ctx['alerts'] —— L1 提醒由 run_daily.py::emit() 用
+    alerts.render_alert_push() 单独入队为独立通知（priority=urgent），
+    见设计文档 §7「每条 L1 单独一条通知」。日报正文只放异动摘要，不重复
+    L1 的内容。
+    """
     movers = _movers(ctx)
     total = len(ctx["attributions"])
     title = f"StockWatch {ctx['d']}　异动 {len(movers)}/{total}"
@@ -95,6 +109,9 @@ def render_push(ctx):
                      f"  {reason[:80]}")
         if len(movers) > 5:
             L.append(f"…另有 {len(movers)-5} 项，详见面板")
+    elif total == 0:
+        # 同 render_markdown 的 Minor 修复：没有数据不能说成「全部无异常」。
+        L.append("今天没有可归因的持仓数据，详见面板。")
     else:
         L.append(f"{total} 只持仓全部无异常，涨跌可由大盘和行业解释。")
 
