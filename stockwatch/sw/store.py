@@ -144,6 +144,35 @@ CREATE TABLE IF NOT EXISTS deepread_results (
 """
 
 
+def _read_only_hint(path, exc):
+    """把只读打开失败翻译成可行动的说明。
+
+    最常见的原因不是「文件不存在」，而是**上一个写入进程留下了陈旧的 WAL
+    边车文件**（`-wal` / `-shm`）：SQLite 的只读连接无法执行 WAL 恢复
+    （恢复要写 `-shm`），于是抛出与「文件不存在」一模一样的
+    `unable to open database file`，让人往错的方向查。
+
+    这里只改报错文案，**不自动退回读写打开** —— 干跑的「严格只读、零副作用」
+    是 P3/P4 两轮修复才立起来的不变式，为了省一次手工操作而破坏它，
+    代价远大于收益。
+    """
+    p = Path(path)
+    if not p.exists():
+        return (f"数据库不存在：{p}\n"
+                f"先跑一次 run_ingest.py 建库，或用 STOCKWATCH_DB 指向已有库。")
+    stale = [s for s in (f"{p}-wal", f"{p}-shm") if Path(s).exists()]
+    if stale:
+        return (f"只读打开失败：{p}\n"
+                f"原因：存在 WAL 边车文件 {', '.join(Path(s).name for s in stale)}，"
+                f"很可能是上一个写入进程被中断留下的陈旧状态。\n"
+                f"只读连接无法执行 WAL 恢复（恢复需要写 -shm），所以报了这个错。\n"
+                f"处理：用读写方式打开一次让它自行恢复即可 ——\n"
+                f"  python3 -c \"import sqlite3;sqlite3.connect('{p}').close()\"\n"
+                f"（干跑不会自动这么做：那会破坏「严格只读」的保证。）\n"
+                f"原始错误：{exc}")
+    return f"只读打开失败：{p}\n原始错误：{exc}"
+
+
 class Store:
     """数据库连接。
 
@@ -157,7 +186,10 @@ class Store:
         if self.read_only:
             # URI mode=ro 会在数据库不存在时直接失败，也不会创建空库。
             uri = f"file:{self.path.resolve()}?mode=ro"
-            self.conn = sqlite3.connect(uri, uri=True)
+            try:
+                self.conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.OperationalError as exc:
+                raise sqlite3.OperationalError(_read_only_hint(self.path, exc)) from exc
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.conn = sqlite3.connect(str(self.path))

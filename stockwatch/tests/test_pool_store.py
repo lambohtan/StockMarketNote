@@ -123,11 +123,43 @@ def test_old_deepread_results_table_gets_backfilled_column():
     st.close()
 
 
+
+def test_read_only_hint_names_the_real_cause():
+    """只读打开失败要说清真因，不能让人往「文件不存在」的方向查。
+
+    真实踩坑（2026-08-29）：上一个写入进程被中断，留下陈旧的 -wal/-shm；
+    SQLite 只读连接无法执行 WAL 恢复（恢复要写 -shm），抛出的错误与
+    「文件不存在」一模一样，都是 unable to open database file。
+    """
+    import sqlite3, os
+    from sw.store import _read_only_hint
+    boom = sqlite3.OperationalError("unable to open database file")
+
+    h = _read_only_hint("/tmp/definitely_not_here_xyz.db", boom)
+    check("不存在时指向建库", "数据库不存在" in h, True)
+
+    tmp = tempfile.mkdtemp()
+    db = os.path.join(tmp, "t.db")
+    sqlite3.connect(db).close()
+    open(db + "-wal", "w").close()
+    open(db + "-shm", "w").close()
+    h = _read_only_hint(db, boom)
+    check("陈旧 WAL 被点名", "WAL 边车文件" in h, True)
+    check("列出具体边车文件", "t.db-wal" in h and "t.db-shm" in h, True)
+    check("不误导成「文件不存在」", "数据库不存在" not in h, True)
+    check("给出恢复办法", "sqlite3.connect" in h, True)
+
+    os.remove(db + "-wal")
+    os.remove(db + "-shm")
+    h = _read_only_hint(db, sqlite3.OperationalError("boom"))
+    check("无边车时不乱归因", "WAL 边车" not in h, True)
+
 for fn in (test_tables_exist, test_filing_texts_unique,
            test_outbox_accepts_pool, test_unknown_kind_still_rejected,
            test_notify_tags_covers_pool_kind,
            test_busy_timeout_set, test_deepread_results_has_disagreements_detail_column,
-           test_old_deepread_results_table_gets_backfilled_column):
+           test_old_deepread_results_table_gets_backfilled_column,
+           test_read_only_hint_names_the_real_cause):
     print(fn.__name__)
     fn()
 
