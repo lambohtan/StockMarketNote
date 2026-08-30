@@ -80,8 +80,8 @@ def test_holdings_anomaly_all_selected():
     ]
     out = P.build(st, Cfg(), "2026-08-29", attributions=attributions)
     picked = {x["ticker"]: x["source"] for x in out}
-    check("extreme 进池", picked.get("NVDA"), "holding_anomaly")
-    check("anomaly 也进池", picked.get("AMD"), "holding_anomaly")
+    check("extreme 进池", picked.get("NVDA"), "holding_event")
+    check("anomaly 也进池", picked.get("AMD"), "holding_event")
     check("正常票不进", "AAPL" in picked, False)
     st.close()
 
@@ -111,7 +111,7 @@ def test_dedup_prefers_holding_anomaly():
     out = P.build(st, Cfg(), "2026-08-29",
                   attributions=[{"ticker": "NVDA", "level": "extreme", "z": 3.2}])
     check("只留一条", len(out), 1)
-    check("原因取持仓异动", out[0]["source"], "holding_anomaly")
+    check("原因取持仓事件", out[0]["source"], "holding_event")
     st.close()
 
 

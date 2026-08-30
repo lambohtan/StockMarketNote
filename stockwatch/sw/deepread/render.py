@@ -8,8 +8,12 @@ from .criteria import CRITERIA
 from .deepread import TEXT_CRITERIA
 
 MAX_PUSH_BYTES = 3800      # ntfy 单条上限 4096 字节，留出头部余量
-SOURCE_LABEL = {"holding_anomaly": "持仓异动", "apewisdom": "社区热度",
-                "form4": "Form 4 申报"}
+SOURCE_LABEL = {"holding_anomaly": "持仓异动", "holding_event": "持仓事件",
+                "apewisdom": "社区热度", "form4": "Form 4 申报"}
+
+# 「数据不足」「基金」不是倾向，渲染时不能套「在你的标准下：X」的句式 ——
+# 那会读成一个方向判断。
+NON_DIRECTIONAL = ("数据不足", "基金")
 
 
 _ELLIPSIS = "…"
@@ -28,6 +32,15 @@ def _clip(text, limit=MAX_PUSH_BYTES):
     suffix = _ELLIPSIS.encode("utf-8")
     b = b[:max(0, limit - len(suffix))]
     return b.decode("utf-8", errors="ignore").rstrip() + _ELLIPSIS
+
+
+
+def _label_line(item):
+    """标签行。非方向性标签（数据不足 / 基金）不套「在你的标准下」的句式。"""
+    score = f"（命中 {item['hit']}/{item['total']}）"
+    if item["label"] in NON_DIRECTIONAL:
+        return f"**{item['label']}**{score}"
+    return f"**在你的标准下：{item['label']}**{score}"
 
 
 def _hit_lines(item):
@@ -73,7 +86,7 @@ def render_report(d, items):
         note = f" · {item['note']}" if item.get("note") else ""
         L += [f"### {item['ticker']} · 入池原因：{item.get('reason', '')}"
               f"（{SOURCE_LABEL.get(item.get('source'), item.get('source', ''))}）", "",
-              f"**在你的标准下：{item['label']}（命中 {item['hit']}/{item['total']}）**{note}", ""]
+              _label_line(item) + note, ""]
         if hit:
             L.append("命中：" + " · ".join(hit))
         if miss:

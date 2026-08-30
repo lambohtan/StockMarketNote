@@ -194,12 +194,46 @@ def test_llm_config_error_bubbles_up():
     check("stage2: LLMConfigError 冒泡而不是被吞成空结果", ok, True)
 
 
+
+def test_tiny_denominator_gets_no_directional_label():
+    """分母太小就不给倾向标签 —— 否则是循环论证。
+
+    2026-08-29 实测：MAGA / VTI 只有「热度跃升」一条可判，1/1 = 1.0 直接顶到
+    0.75 阈值之上拿到「偏正面」。而那唯一命中的一条**正是它们进池的原因**：
+    进池因为热度涨，标签偏正面也因为热度涨，同一个事实用了两遍。
+    比例阈值天然让分母越小标签越极端，方向正好反了。
+    """
+    check("1/1 不给方向", D.label_for(1, 1, 0)["label"], "数据不足")
+    check("1/1 说明可判条数", "1 条" in D.label_for(1, 1, 0)["note"], True)
+    check("2/2 仍不给方向", D.label_for(2, 2, 0)["label"], "数据不足")
+    check("3/3 才开始给", D.label_for(3, 3, 0)["label"], "偏正面")
+    check("3 条里命中 0 也给方向", D.label_for(0, 3, 0)["label"], "偏负面")
+
+
+def test_fund_gets_no_directional_label():
+    """ETF/基金不给标签：营收、现金流、毛利率对它们根本不适用。"""
+    r = D.label_for(5, 6, 0, is_fund=True)
+    check("基金不给方向", r["label"], "基金")
+    check("基金注明原因", "不适用" in r["note"], True)
+
+
+def test_stage2_passes_fund_flag_through():
+    llm = {"hits": {}, "quotes": {}, "text_hits": {}}
+    facts_fund = dict(FACTS, is_fund=True)
+    r = D.stage2(Cfg(), "VTI", PY_RESULT, llm, facts_fund,
+                 caller=lambda *a, **k: "发生了什么：略。")
+    check("stage2 认得基金", r["label"], "基金")
+    check("四段叙述照常出", "发生了什么" in r["narrative"], True)
+
 for fn in (test_material_excludes_py_conclusions, test_stage1_parses_json,
            test_stage1_llm_failure_returns_empty, test_stage1_garbage_returns_empty,
            test_disagreements_listed, test_label_thresholds,
            test_label_thresholds_scale_with_shrunk_denominator,
            test_two_disagreements_lower_confidence,
            test_stage2_counts_text_hits_into_score,
+           test_tiny_denominator_gets_no_directional_label,
+           test_fund_gets_no_directional_label,
+           test_stage2_passes_fund_flag_through,
            test_stage2_without_llm_still_produces_py_part,
            test_stage2_total_bounded_by_text_criteria_even_with_extraneous_llm_keys,
            test_stage2_rejects_stringy_truthiness_in_text_hits,

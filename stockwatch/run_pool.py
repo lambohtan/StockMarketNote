@@ -131,10 +131,14 @@ def one_item_dry_run(store, cfg, d, entry, held=None):
     facts = FA.collect(store, cfg, ticker, d, held_tickers=held,
                        fin=lambda _ticker: {})
     py = CR.evaluate(facts)
-    tag = DR.label_for(py["hit"], py["total"], 0)
+    # 干跑跳过 yfinance，所以 is_fund 恒为 False —— ETF 在干跑里认不出来，
+    # 报告里如实说明，别让人以为基金判定失效了。
+    tag = DR.label_for(py["hit"], py["total"], 0,
+                       is_fund=bool(facts.get("is_fund")))
     return {"ticker": ticker, "label": tag["label"], "note": tag["note"],
             "hit": py["hit"], "total": py["total"],
-            "narrative": "[dry-run] 未调用 LLM，本节只展示 py 六条硬指标的判定结果。",
+            "narrative": "[dry-run] 未调用 LLM，本节只展示 py 六条硬指标的判定结果。\n"
+                         "干跑不调 yfinance，因此 ETF/基金在这里认不出来（真跑才判）。",
             "disagreements": [], "text_hits": {}, "text_quotes": {},
             "model": "dry-run（未调用 LLM）", "disclaimer": CR.DISCLAIMER,
             "source": entry["source"], "reason": entry["reason"],
@@ -249,7 +253,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--date", help="指定逻辑日期，默认今天")
-    ap.add_argument("--limit", type=int, default=3, help="新票名额，默认 3")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="新票名额，默认读 config.yaml 的 pool.new_slots（8）")
     a = ap.parse_args()
 
     d = a.date or local_logical_date()
@@ -265,8 +270,12 @@ def main():
             holdings = []
         held = [h.ticker for h in holdings]
 
+        slots = a.limit if a.limit is not None else int(
+            CFG.get("pool.new_slots", PL.DEFAULT_NEW_SLOTS) or PL.DEFAULT_NEW_SLOTS)
+        # held 全量传进去：持仓的入池不再只看价格异动，还看重大 8-K、
+        # 财报刚发布、Form 4 集中 —— 平静的持仓一条都不会冒出来。
         entries = PL.build(st, CFG, d, attributions=_attributions(st, CFG, d, holdings),
-                           new_slots=a.limit)
+                           new_slots=slots, held_tickers=held)
         log(f"入池 {len(entries)} 只：" + ", ".join(e["ticker"] for e in entries))
         # 裁定 1：干跑换一条完全离线的单只票处理路径，不联网、不调 LLM。
         if a.dry_run:

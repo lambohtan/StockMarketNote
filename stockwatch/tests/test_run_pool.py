@@ -125,7 +125,8 @@ def test_dry_run_process_is_offline_and_read_only():
 
     calls = {"pool_build": 0, "edgar": 0, "news": 0, "stage1": 0, "stage2": 0}
 
-    def fake_pool_build(store, cfg, d, attributions=None, new_slots=3):
+    def fake_pool_build(store, cfg, d, attributions=None, new_slots=3,
+                        held_tickers=None):
         calls["pool_build"] += 1
         if not store.read_only:
             raise AssertionError("dry-run 必须使用只读 Store 构建池子")
@@ -274,7 +275,8 @@ def test_empty_pool_produces_no_alert():
     st.close()
     tmpdir = tempfile.mkdtemp()
 
-    def fake_pool_build(store, cfg, d, attributions=None, new_slots=3):
+    def fake_pool_build(store, cfg, d, attributions=None, new_slots=3,
+                        held_tickers=None):
         return []
 
     class ProcessCfg(Cfg):
@@ -313,7 +315,8 @@ def test_all_tickers_failed_triggers_pool_alert():
     st.close()
     tmpdir = tempfile.mkdtemp()
 
-    def fake_pool_build(store, cfg, d, attributions=None, new_slots=3):
+    def fake_pool_build(store, cfg, d, attributions=None, new_slots=3,
+                        held_tickers=None):
         return [{"ticker": "BAD", "source": "apewisdom", "reason": "r",
                 "strength": 1}]
 

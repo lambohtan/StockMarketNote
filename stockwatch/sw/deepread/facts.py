@@ -55,6 +55,12 @@ def financials(ticker):
             v = info.get(name)
             if isinstance(v, (int, float)):
                 out[key] = float(v)
+        # 基金判定顺路取，不额外发请求：info 这一次调用本来就要发。
+        # 六条标准里三条是公司财务指标，对 ETF/基金根本不适用 —— 认出来才能
+        # 不给它们倾向标签（否则必然永远小分母、永远拿极端标签）。
+        qt = str(info.get("quoteType") or "").upper()
+        if qt:
+            out["is_fund"] = qt in ("ETF", "MUTUALFUND", "INDEX")
     except Exception as e:
         errors.append(f"info {type(e).__name__}: {e}")
     if errors:
@@ -182,6 +188,9 @@ def collect(store, cfg, ticker, d, held_tickers=None, fin=None):
         "rank_delta": (prev - rank) if (rank is not None and prev is not None) else None,
         "pe": _nan_to_none(f.get("pe")),
         "forward_pe": _nan_to_none(f.get("forward_pe")),
+        # 取不到 quoteType 时保持 False（当成个股），不进 FIELDS 的缺失统计 ——
+        # 它是分类标记，不是一条判定标准。干跑跳过 yfinance，所以干跑里恒为 False。
+        "is_fund": bool(f.get("is_fund")),
     }
     out["missing"] = [k for k in FIELDS if out.get(k) is None]
     return out

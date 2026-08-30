@@ -54,6 +54,12 @@ llm:
   model: "claude-opus-5"
   max_tokens: 2000
 
+# 股票池深读
+pool:
+  # 每天让 LLM 深读的**新票**名额。持仓的事件票不占这个名额，另外算。
+  # 每只票约 75 秒（2 次 LLM 调用），8 只约 10 分钟。
+  new_slots: 8
+
 portfolio:
   # 核心仓：独立定投，集中度分析里单列一份「剔除核心仓」的视角
   core_tickers: ["VOO"]

@@ -207,10 +207,31 @@ def disagreements(py_result, llm_result):
     return out
 
 
-def label_for(hit, total, n_disagree):
-    """比例阈值：≥0.75 偏正面，<0.375 偏负面，中间中性。"""
+MIN_TOTAL_FOR_LABEL = 3
+
+
+def label_for(hit, total, n_disagree, is_fund=False):
+    """比例阈值：≥0.75 偏正面，<0.375 偏负面，中间中性。
+
+    **分母低于 `MIN_TOTAL_FOR_LABEL` 就不给方向。** 2026-08-29 实测暴露的问题：
+    MAGA / VTI 只有「热度跃升」一条可判，1/1 = 1.0 直接顶到 0.75 之上拿到
+    「偏正面」—— 而那唯一命中的一条**正是它们进池的原因**。进池因为热度涨、
+    标签偏正面也因为热度涨，同一个事实用了两遍，是循环论证。
+    比例阈值天然让分母越小标签越极端，方向正好反了，所以要有下限。
+
+    **ETF / 基金一律不给方向**：六条标准里三条是公司财务指标（营收、现金流、
+    毛利率），对基金根本不适用，必然永远缺失、永远小分母、永远拿极端标签。
+
+    两种情况下四段叙述与分歧节都照常产出 —— 用户 2026-08-29 明确要的是
+    「低分母的票也留下，交给 LLM 做判断」，去掉的只是那个会误导的标签。
+    """
+    if is_fund:
+        return {"label": "基金", "note": "ETF/基金：公司财务指标不适用，不给倾向"}
     if total <= 0:
         return {"label": "数据不足", "note": "没有任何一条标准可判定"}
+    if total < MIN_TOTAL_FOR_LABEL:
+        return {"label": "数据不足",
+                "note": f"仅 {total} 条可判（命中 {hit}），不足以给倾向"}
     ratio = hit / total
     label = ("偏正面" if ratio >= POSITIVE_RATIO
              else "偏负面" if ratio < NEGATIVE_RATIO else "中性")
@@ -245,7 +266,7 @@ def stage2(cfg, ticker, py_result, llm_result, facts, store=None, caller=None):
     hit = py_result["hit"] + sum(1 for v in known_text.values() if v)
     total = py_result["total"] + len(known_text)
     dis = disagreements(py_result, llm_result)
-    tag = label_for(hit, total, len(dis))
+    tag = label_for(hit, total, len(dis), is_fund=bool(facts.get("is_fund")))
 
     llm_hits = (llm_result or {}).get("hits") or {}
     llm_quotes = (llm_result or {}).get("quotes") or {}
