@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.13 · pandas 3.0 · numpy 2.5 · yfinance 1.7 · edgartools · SQLite (stdlib) · launchd · ntfy · Claude Code CLI (`claude -p`) 或 Anthropic API
 
-**Spec:** [docs/superpowers/specs/2026-08-27-daily-push-and-menubar-design.md](../specs/2026-08-27-daily-push-and-menubar-design.md)
+**Spec:** [docs/superpowers/specs/2026-08-27-daily-push-and-menubar-design.md](2026-08-27-daily-push-and-menubar-design.md)
 
 **不在本计划范围内:** P4 的完整评分卡（关注度/趋势/基本面/组合契合四维打分）、P5 对冲配比、菜单栏应用与 FastAPI 面板。本计划的日报里「观察池」只做**增量事件**（Task 11）：Reddit 排名跃升与 Form 4 内部人买入，两者的数据 P1 已在每天入库。13F cluster 检测属于 P4，但本计划会把 13F-HR 加进抓取范围让数据先攒起来 —— 与 Reddit 同理，早一天开始攒就早一天能回看。
 

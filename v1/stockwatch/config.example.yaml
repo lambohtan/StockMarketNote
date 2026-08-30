@@ -1,0 +1,45 @@
+# Archival example only; this file is not the private V1 configuration.
+# If used, sec_email must be replaced with a real contact address.
+# Public ntfy topics are unsafe; use a private topic only in ignored local data.
+# V1 is frozen and is not expected to run at its new archive path.
+
+identity:
+  sec_email: "you@example.com"
+data:
+  db_path: "data/stockwatch.db"
+  uploads_dir: "uploads"
+benchmarks:
+  market: "SPY"
+  growth: "QQQ"
+  rates: "TLT"
+  gold: "GLD"
+  sectors: {}
+reddit:
+  filters: ["all-stocks", "wallstreetbets", "stocks"]
+  top_n: 100
+history:
+  price_period: "2y"
+notify:
+  ntfy_topic: "replace-with-a-private-topic"
+  ntfy_server: "https://ntfy.sh"
+llm:
+  provider: "claude_cli"
+  claude_bin: "/absolute/path/to/claude"
+  model: "claude-opus-5"
+  max_tokens: 2000
+pool:
+  new_slots: 8
+portfolio:
+  core_tickers: ["VOO"]
+  exclude_tickers: []
+  look_through_etfs: ["QQQ", "VOO", "SPY"]
+stress_scenarios: []
+schedule:
+  compute_daily: "06:00"
+  compute_retry: "07:00"
+  compute_weekly: "06:30"
+  pool_daily: "06:45"
+  weekly_day: "tuesday"
+  push_time: "08:00"
+notify_policy:
+  l1_immediate: false

@@ -1,12 +1,22 @@
 __pycache__/
 *.pyc
+
+# Private and generated runtime data
+v1/local-data/
+v2/local-data/
+v2/reports/
+*.csv
+*.db
+*.db-wal
+*.db-shm
+
+# Legacy path-specific guards retained during the archive move
 stockwatch/data/*.db
 stockwatch/data/*.db-wal
 stockwatch/data/*.db-shm
 stockwatch/uploads/*
 !stockwatch/uploads/.gitkeep
 .env
-*.csv
 
 # SDD 工作区（subagent 驱动开发的临时产物）
 .superpowers/
