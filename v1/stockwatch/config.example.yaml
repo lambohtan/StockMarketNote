@@ -30,7 +30,8 @@ llm:
 pool:
   new_slots: 8
 portfolio:
-  core_tickers: ["VOO"]
+  # Do not copy real holdings into this tracked example.
+  core_tickers: ["REPLACE_WITH_TICKER"]
   exclude_tickers: []
   look_through_etfs: ["QQQ", "VOO", "SPY"]
 stress_scenarios: []

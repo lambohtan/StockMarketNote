@@ -16,6 +16,7 @@ stockwatch/data/*.db-wal
 stockwatch/data/*.db-shm
 stockwatch/uploads/*
 !stockwatch/uploads/.gitkeep
+stockwatch/config.yaml
 .env
 
 # SDD 工作区（subagent 驱动开发的临时产物）
