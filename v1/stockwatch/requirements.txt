@@ -1,7 +1,0 @@
-yfinance>=1.7.0
-edgartools>=5.0
-requests>=2.31
-pandas>=2.0
-numpy>=1.26
-PyYAML>=6.0
-litellm>=1.0

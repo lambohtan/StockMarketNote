@@ -1,0 +1,14 @@
+{
+  "top_n": 20,
+  "min_price": 3.0,
+  "min_market_cap": 300000000,
+  "keep_runs": 30,
+  "max_age_hours": 36,
+  "weights": {
+    "apewisdom:all-stocks": 0.35,
+    "apewisdom:wallstreetbets": 0.2,
+    "stocktwits:trending": 0.25,
+    "nasdaq:dollar-volume": 0.15,
+    "nasdaq:advanced": 0.05
+  }
+}
