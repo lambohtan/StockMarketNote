@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import date
@@ -22,7 +23,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from lean.env import load_env  # noqa: E402
 
 load_env()
-RESULTS = REPO_ROOT / "local-data" / "tradingagents"
+RESULTS = Path(os.environ.get("STOCKWATCH_DATA_DIR", REPO_ROOT / "local-data")) / "tradingagents"
 
 
 def parse_args() -> argparse.Namespace:

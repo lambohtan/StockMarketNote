@@ -1,6 +1,6 @@
 # StockWatch
 
-状态：候选股票池、Reddit 预抓取、单票研究管线可运行并已实测；跨股票排名 → Top10 → outbox → 投递仍未实现
+状态：候选股票池、Reddit 预抓取、单票研究管线可运行；macOS 状态栏宿主、独立定时任务和本地 Dashboard 已实现；跨股票排名 → Top10 → outbox → 手机投递仍未实现
 截至：2026-08-31
 
 **输出是研究材料，不是下单指令。**
@@ -8,6 +8,17 @@
 ---
 
 ## 一分钟版本
+
+常驻运行（已安装在本机）：
+
+```text
+/Applications/StockWatch.app
+```
+
+启动后点击 macOS 状态栏的图表图标，可打开 Dashboard、启动/停止本地服务、
+设置登录时启动或退出。Dashboard 内可单独调度、立即运行或停止每个任务。
+
+命令行开发：
 
 ```bash
 python3 -m venv .venv
@@ -32,6 +43,7 @@ python3 -m venv .venv
 | `prefetch_reddit.py --pool-file <FILE>` | Reddit 预抓取段：股票池 → 一周原始帖子/评论 → SQLite。抓取时不筛选、不调用 LLM。 |
 | `run_lean.py <TICKER>` | **单票研究日常入口。**7 节点精简管线，约 3 分钟 / $0.20–0.26。 |
 | `run_analysis.py <TICKER>` | 上游 12 节点原貌，含 Trader 与 Portfolio Manager，**会输出买卖指令**。仅供人工观察上游行为，不接入任何自动流程。 |
+| `stockwatch_service.py` | macOS sidecar/本地开发入口：定时器、任务状态、日志和 `127.0.0.1` Dashboard。 |
 
 诊断工具（`tools/`，不属于产品流程）：
 
@@ -51,6 +63,9 @@ python3 -m venv .venv
 | `docs/` | 契约与运行手册，见下方文档索引 |
 | `tests/` | 单元测试（离线，不联网） |
 | `tools/` | 诊断脚本 |
+| `stockwatch_app/` | 长期运行宿主：配置、运行账本、调度、任务适配、HTTP API 和 Dashboard |
+| `macos/` | 原生 AppKit 状态栏宿主与 `Info.plist` |
+| `scripts/build_macos_app.sh` | 构建/安装标准 `StockWatch.app` bundle |
 | `vendor/TradingAgents/` | 上游原貌副本 + 6 处改动，清单见 [vendor/README.md](vendor/README.md) |
 | `local-data/` | 池子数据库、缓存、报告和 memory log。**未被 Git 跟踪** |
 
@@ -73,6 +88,27 @@ run_lean.py <TICKER>     → 评级 + 理由 + 证据健康度
 - 候选池：来源、打分、存储、读取、配置 → [候选股票池构建](docs/pool.md)
 - Reddit 预抓取：CLI、缓存契约、限流 → [Reddit 预抓取接口](docs/reddit-prefetch.md)
 - 单票研究：参数、实测数据、已知问题、未验证项 → [lean 运行手册](docs/lean-pipeline.md)
+- macOS 状态栏应用、调度、本地 UI 和打包边界 → [macOS 应用设计与验收](docs/macos-app.md)
+
+## macOS 应用默认调度
+
+| 任务 | 默认 | 本地时间 | 说明 |
+| --- | --- | --- | --- |
+| 候选股票池 | 开 | 06:00，每天 | 不调用 LLM |
+| Reddit 预抓取 | 开 | 06:30，每天 | 从最新 pool 快照读取 ticker；受持久限流约束 |
+| Lean 分析师 | **关** | 07:00，工作日 | 可在 UI 启用；默认串行，避免未经确认的长时间 LLM 运行 |
+| 本地报告发布 | 开 | 08:00，工作日 | 只生成本地 Markdown；不发手机 |
+
+可在 Dashboard 修改任务开关、日程、运行日和所有受支持的 CLI 参数。
+配置、运行账本、日志和应用数据位于 `~/Library/Application Support/StockWatch/`，
+不向只读 `.app` 包内写数据。
+
+重新构建：
+
+```bash
+scripts/build_macos_app.sh
+scripts/build_macos_app.sh --install --migrate-local-data
+```
 
 ---
 
@@ -83,8 +119,8 @@ run_lean.py <TICKER>     → 评级 + 理由 + 证据健康度
 → Python 跨股票确定性排名 → Top10 → SQLite/outbox → 本地墙钟 08:00 投递
 ```
 
-已实现头两段（股票池、预筛）和中间的 research Agents；**Research Verdict 结构化输出、
-跨股票排名、Top10、outbox、调度、投递均不存在**。研究管线目前产出的是给人读的文本，
+已实现头两段（股票池、预筛）和中间的 research Agents；通用本地调度器已由 macOS 宿主提供，但 **Research Verdict 结构化输出、
+跨股票排名、Top10、outbox 和手机投递仍不存在**。研究管线目前产出的是给人读的文本，
 不是给排名层消费的数据。
 
 ---
@@ -106,6 +142,7 @@ V1 的代码与文档已从仓库移除，只存在于 707d7de 及更早的 git 
 - [候选股票池构建](docs/pool.md)
 - [Reddit 预抓取接口](docs/reddit-prefetch.md)
 - [lean 单票研究运行手册](docs/lean-pipeline.md)
+- [macOS 状态栏应用](docs/macos-app.md)
 - [测试目录](tests/README.md)
 
 设计草案，尚未实现：

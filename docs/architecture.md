@@ -13,6 +13,8 @@
 | Ticker normalizer and candidate union | 已实现并实测 | `lean/pool.py` |
 | Deterministic 20–30 prefilter | 已实现并实测（确定性打分 + 读时截断，池子大小可配） | `lean/pool.py`、`lean/pool_store.py` |
 | Per-ticker Agent adapter | 部分实现：可产出给人读的研究文本，不是结构化结果 | `lean/pipeline.py`，见[运行手册](lean-pipeline.md) |
+| macOS 运行宿主与通用 Job scheduler | 已实现：状态栏、防重入调度、运行账本、停止和本地 Dashboard | `macos/`、`stockwatch_app/`，见[macOS 应用](macos-app.md) |
+| Local report publisher | 已实现：汇总现有文章为本地 Markdown；不等于 Top10/outbox/送达 | `stockwatch_app/tasks.py` |
 | Research Verdict validator | 未实现 | — |
 | Deterministic cross-ticker ranker | 未实现 | — |
 | Top 10 renderer | 未实现 | — |

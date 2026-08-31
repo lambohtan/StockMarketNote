@@ -14,7 +14,25 @@ import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SEARCH_PATHS = (REPO_ROOT / ".env",)
+
+
+def _search_paths() -> tuple[Path, ...]:
+    """Resolve runtime-owned credentials before the repository fallback.
+
+    The macOS application keeps private files outside its read-only bundle.
+    Explicit process environment still wins because ``load_dotenv`` uses
+    ``override=False`` below.
+    """
+
+    configured = os.environ.get("STOCKWATCH_ENV_FILE")
+    support = os.environ.get("STOCKWATCH_SUPPORT_DIR")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    if support:
+        candidates.append(Path(support).expanduser() / ".env")
+    candidates.append(REPO_ROOT / ".env")
+    return tuple(dict.fromkeys(candidates))
 
 
 def load_env() -> list[Path]:
@@ -24,7 +42,7 @@ def load_env() -> list[Path]:
         from dotenv import load_dotenv
     except ImportError:
         return loaded
-    for path in SEARCH_PATHS:
+    for path in _search_paths():
         if path.is_file():
             load_dotenv(path, override=False)
             loaded.append(path)

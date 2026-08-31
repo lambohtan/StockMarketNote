@@ -3,9 +3,7 @@
 实现状态：未实现
 截至：2026-08-31
 
-本文描述未来报告和本地投递的接口边界；`SQLite/outbox`、scheduler、notifier 和任何 topic 都不是当前代码或当前运行配置。Reddit 数据段已有可被未来 scheduler 调用的
-`prefetch_reddit.py` CLI 和独立 SQLite 缓存，但这不等于通用 scheduler、launchd 或
-08:00 交付链已经实现；边界见 [Reddit 预抓取接口](reddit-prefetch.md)。
+本文描述未来 Top10 报告与外部投递的接口边界；`SQLite/outbox`、notifier 和任何 topic 仍不是当前代码或当前运行配置。macOS 宿主现已提供通用本地 scheduler 和 08:00 `publish_report` Job，但该 Job 只汇总现有文章到本地 Markdown，不是 Top10、outbox 或实际送达；边界见 [macOS 应用](macos-app.md)。Reddit 数据段则由同一宿主的独立 Job 调用现有 CLI。
 
 ## 报告与事件
 

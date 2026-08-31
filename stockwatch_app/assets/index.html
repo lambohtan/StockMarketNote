@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="StockWatch 本地研究运行中心">
+  <title>StockWatch · 运行中心</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><span></span><span></span><span></span></div>
+        <div><strong>StockWatch</strong><small>LOCAL RESEARCH OS</small></div>
+      </div>
+      <nav id="nav" aria-label="主导航">
+        <button class="nav-item active" data-page="overview"><span>◈</span>运行中心</button>
+        <button class="nav-item" data-page="pool"><span>◇</span>候选股票池</button>
+        <button class="nav-item" data-page="analysis"><span>◌</span>分析师文章</button>
+        <button class="nav-item" data-page="reddit"><span>◎</span>Reddit 信息</button>
+        <button class="nav-item" data-page="settings"><span>⚙</span>调度与设置</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="privacy-dot"></span>
+        <div><b>仅在本机运行</b><small>127.0.0.1 · 无公网入口</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <button id="mobile-menu" class="icon-button" aria-label="打开导航">☰</button>
+        <div><p id="eyebrow">SYSTEM OVERVIEW</p><h1 id="page-title">运行中心</h1></div>
+        <div class="top-actions">
+          <span id="service-pill" class="service-pill"><i></i><span>正在连接</span></span>
+          <button id="refresh" class="icon-button" aria-label="刷新">↻</button>
+        </div>
+      </header>
+
+      <section id="page-overview" class="page active" aria-labelledby="page-title">
+        <div class="hero-grid">
+          <article class="hero-card">
+            <p class="kicker">AUTOMATION PULSE</p>
+            <h2>把每一段研究管线<br><em>保持在可见状态</em></h2>
+            <p>股票池、Reddit、Lean 分析与本地报告彼此独立，可单独定时、停止或手动执行。</p>
+            <div class="hero-meta">
+              <div><span id="hero-active">0</span><small>正在运行</small></div>
+              <div><span id="hero-enabled">0</span><small>已启用任务</small></div>
+              <div><span id="hero-uptime">—</span><small>服务运行</small></div>
+            </div>
+          </article>
+          <article class="boundary-card">
+            <span class="boundary-label">DELIVERY BOUNDARY</span>
+            <h3>本地发布</h3>
+            <p>报告会按时生成并在这里可见。手机通知尚未实现，不会伪装成“已送达”。</p>
+            <div class="boundary-status"><i></i> PHONE DELIVERY · NOT IMPLEMENTED</div>
+          </article>
+        </div>
+        <div class="section-head"><div><p class="kicker">INDEPENDENT JOBS</p><h2>任务状态</h2></div><span class="muted">本地时区 · 防重入</span></div>
+        <div id="task-grid" class="task-grid skeleton-grid"></div>
+        <div class="section-head"><div><p class="kicker">RECENT ACTIVITY</p><h2>最近运行</h2></div></div>
+        <div class="table-card"><div id="runs-table" class="data-table empty-state">正在读取…</div></div>
+      </section>
+
+      <section id="page-pool" class="page">
+        <div id="pool-summary" class="summary-strip"></div>
+        <div class="panel">
+          <div class="panel-head"><div><p class="kicker">LATEST SNAPSHOT</p><h2>当前候选股票池</h2></div><input id="pool-search" class="search" type="search" placeholder="搜索代码或公司…"></div>
+          <div id="pool-table" class="data-table empty-state">正在读取…</div>
+        </div>
+      </section>
+
+      <section id="page-analysis" class="page">
+        <div class="split-layout">
+          <div class="panel list-panel">
+            <div class="panel-head"><div><p class="kicker">RESEARCH LIBRARY</p><h2>最新分析文章</h2></div></div>
+            <div id="analysis-list" class="analysis-list empty-state">正在读取…</div>
+          </div>
+          <article class="article-view">
+            <div id="article-placeholder" class="article-placeholder"><span>◌</span><h3>选择一篇文章</h3><p>可查看研究结论、市场、情绪、新闻、基本面与多空原文。</p></div>
+            <div id="article-content" hidden><p class="kicker">ANALYST NOTE</p><h2 id="article-title"></h2><pre id="article-body"></pre></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="page-reddit" class="page">
+        <div class="panel">
+          <div class="panel-head"><div><p class="kicker">RAW CACHE · READ ONLY</p><h2>Reddit 最新信息</h2><p class="muted">展示预抓取原始帖子；不把缺失数据解释成“无人讨论”。</p></div></div>
+          <div id="reddit-list" class="reddit-list empty-state">正在读取…</div>
+        </div>
+      </section>
+
+      <section id="page-settings" class="page">
+        <form id="settings-form">
+          <div class="settings-intro">
+            <div><p class="kicker">CONTROL PLANE</p><h2>调度与命令参数</h2><p>所有参数都是类型化字段，不会把界面文本拼成 shell 命令。</p></div>
+            <label class="master-switch"><span><b>总调度器</b><small>暂停后仍可手动执行单个任务</small></span><input id="scheduler-enabled" type="checkbox"><i></i></label>
+          </div>
+          <div id="settings-tasks" class="settings-grid"></div>
+          <div class="save-bar"><span id="save-status"></span><button class="button primary" type="submit">保存设置</button></div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="log-modal" class="modal" hidden><div class="modal-card"><div class="modal-head"><div><p class="kicker">RUN LOG</p><h2 id="log-title">运行日志</h2></div><button id="close-log" class="icon-button" aria-label="关闭">×</button></div><pre id="log-body"></pre></div></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

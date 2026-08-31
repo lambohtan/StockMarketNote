@@ -20,3 +20,7 @@ vendor/**/*.egg-info/
 
 # Isolated feature worktrees
 .worktrees/
+
+# macOS application build artifacts
+build/
+dist/
